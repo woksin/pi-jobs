@@ -10,7 +10,7 @@ import { join } from "node:path";
 import { createJobsExtension, CUSTOM_TYPE } from "../src/extension.ts";
 import type { JobManager } from "../src/jobs.ts";
 import { sleep, tempDir, waitUntil } from "./helpers.ts";
-import { runtimeDirectory } from "./runtime.ts";
+import { piAiEntry, runtimeDirectory } from "./runtime.ts";
 
 const RUNTIME = runtimeDirectory();
 const available = RUNTIME !== undefined && existsSync(join(RUNTIME, "dist/index.js"));
@@ -30,7 +30,7 @@ interface HarnessOptions {
 
 async function harness(t: Parameters<typeof tempDir>[0], opts: HarnessOptions = {}) {
 	const pc: any = await import(join(RUNTIME!, "dist/index.js"));
-	const ai: any = await import(join(RUNTIME!, "node_modules/@earendil-works/pi-ai/dist/index.js"));
+	const ai: any = await import(piAiEntry(RUNTIME)!);
 	const dir = tempDir(t);
 	const agentDir = join(dir, "agent");
 	const faux = ai.fauxProvider({ provider: `pijobs-faux-${process.pid}-${++providerSeq}`, models: [{ id: "m1" }] });

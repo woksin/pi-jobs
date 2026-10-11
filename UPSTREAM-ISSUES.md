@@ -1,6 +1,6 @@
 # Upstream issues (pi runtime) affecting pi-jobs delivery
 
-Draft issue texts for `@earendil-works/pi-coding-agent` (observed on 1.0.3). pi-jobs does not
+Draft issue texts for `@earendil-works/pi-coding-agent` (observed on 1.0.3; line numbers below refer to that version). pi-jobs does not
 work around these with timers or heuristics. The two races (#1 and #2) have deterministic
 reproductions in `test/agent-session.test.ts`; they are skipped and point here. Line references are to
 `dist/core/agent-session.js`.

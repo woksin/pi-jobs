@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createJobsExtension, CUSTOM_TYPE, liveManagers } from "../src/extension.ts";
-import { runtimeDirectory } from "./runtime.ts";
+import { piAiEntry, runtimeDirectory } from "./runtime.ts";
 import defaultExtension from "../src/extension.ts";
 import { alive, readPid, sleep, tempDir, waitUntil } from "./helpers.ts";
 import type { JobManager } from "../src/jobs.ts";
@@ -382,7 +382,7 @@ test("each extension instance (e.g. a subagent session) owns its jobs", async t 
 });
 
 const RUNTIME = runtimeDirectory();
-const PI_AI = RUNTIME ? join(RUNTIME, "node_modules/@earendil-works/pi-ai/dist/index.js") : undefined;
+const PI_AI = piAiEntry(RUNTIME);
 
 test("tool schemas enforce the bounds through pi's own argument validation", { skip: PI_AI && existsSync(PI_AI) ? false : "pi-ai not found; install the pi runtime or set PI_RUNTIME_DIR" }, async t => {
 	const { validateToolArguments } = await import(PI_AI!);

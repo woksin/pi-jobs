@@ -15,3 +15,13 @@ export function runtimeDirectory(): string | undefined {
 		join(homedir(), ".pi", "agent", "npm", packagePath),
 	].find(directory => existsSync(join(directory, "dist/index.js")));
 }
+
+/** Locate pi-ai's entry: nested under the runtime (global installs) or hoisted next to it (local devDependency installs). */
+export function piAiEntry(runtime: string | undefined): string | undefined {
+	if (!runtime) return undefined;
+	const candidates = [
+		join(runtime, "node_modules/@earendil-works/pi-ai/dist/index.js"),
+		join(dirname(dirname(runtime)), "@earendil-works/pi-ai/dist/index.js"),
+	];
+	return candidates.find(existsSync);
+}
