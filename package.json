@@ -1,0 +1,23 @@
+{
+  "name": "@woksin/pi-jobs",
+  "version": "0.1.0",
+  "description": "Background shell jobs and watches that wake the pi agent on completion",
+  "license": "MIT",
+  "author": "woksin",
+  "keywords": ["pi-package", "pi-extension", "pi", "background-jobs", "shell"],
+  "repository": { "type": "git", "url": "git+https://github.com/woksin/pi-jobs.git" },
+  "homepage": "https://github.com/woksin/pi-jobs#readme",
+  "bugs": { "url": "https://github.com/woksin/pi-jobs/issues" },
+  "publishConfig": { "access": "public" },
+  "files": ["src/", "README.md", "LICENSE", "package.json"],
+  "type": "module",
+  "scripts": {
+    "test": "node --test --test-timeout=30000 'test/*.test.ts'"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./src/extension.ts"]
+  }
+}
