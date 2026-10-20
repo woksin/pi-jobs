@@ -171,8 +171,17 @@ test("a hung check is killed by the per-check timeout and the watch continues", 
 test("concurrency cap rejects with a clear error", async t => {
 	const { dir, manager } = setup(t, { maxRunning: 2 });
 	manager.start({ command: "sleep 100", cwd: dir, timeoutSeconds: 60 });
-	manager.watch({ ...watchDefaults, check: "exit 1", cwd: dir, intervalSeconds: 5 });
+	manager.start({ command: "sleep 100", cwd: dir, timeoutSeconds: 60 });
 	assert.throws(() => manager.start({ command: "true", cwd: dir, timeoutSeconds: 60 }), /Too many running background jobs \(2\/2\)/);
+});
+
+test("watches have their own cap and do not use command slots", async t => {
+	const { dir, manager } = setup(t, { maxRunning: 1, maxRunningWatches: 2 });
+	manager.watch({ ...watchDefaults, check: "exit 1", cwd: dir, intervalSeconds: 5 });
+	manager.watch({ ...watchDefaults, check: "exit 1", cwd: dir, intervalSeconds: 5 });
+	manager.start({ command: "sleep 100", cwd: dir, timeoutSeconds: 60 }); // watches don't block commands
+	assert.throws(() => manager.watch({ ...watchDefaults, check: "exit 1", cwd: dir, intervalSeconds: 5 }), /Too many running background watches \(2\/2\)/);
+	assert.throws(() => manager.start({ command: "true", cwd: dir, timeoutSeconds: 60 }), /Too many running background jobs \(1\/1\)/);
 });
 
 test("invalid cwd is rejected without spawning", t => {

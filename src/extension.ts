@@ -31,6 +31,7 @@ export const OUTPUT_BYTES = 16 * 1024;
 export interface JobsExtensionOptions {
 	logRoot?: string;
 	maxRunning?: number;
+	maxRunningWatches?: number;
 	killGraceMs?: number;
 	drainMs?: number;
 	logCapBytes?: number;
@@ -200,6 +201,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 		const manager: JobManager = new JobManager({
 			logRoot,
 			maxRunning: options.maxRunning,
+			maxRunningWatches: options.maxRunningWatches,
 			killGraceMs: options.killGraceMs,
 			drainMs: options.drainMs,
 			logCapBytes: options.logCapBytes,

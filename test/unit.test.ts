@@ -189,12 +189,19 @@ test("resolveManagerOptions: explicit undefined never replaces a default", () =>
 		onActiveChange: undefined,
 	});
 	assert.equal(o.maxRunning, 8);
+	assert.equal(o.maxRunningWatches, 32);
 	assert.equal(o.killGraceMs, 5000);
 	assert.equal(o.keepFinished, 50);
 	assert.equal(o.checkOutputBytes, 64 * 1024);
 	assert.equal(o.env, process.env);
 	assert.equal(typeof o.onActiveChange, "function");
 	assert.equal(resolveManagerOptions({ logRoot: "/x", onTerminal() {}, maxRunning: 2 }).maxRunning, 2);
+	const fromEnv = resolveManagerOptions({ logRoot: "/x", onTerminal() {}, env: { PI_JOBS_MAX_RUNNING: "12", PI_JOBS_MAX_WATCHES: "64" } });
+	assert.equal(fromEnv.maxRunning, 12);
+	assert.equal(fromEnv.maxRunningWatches, 64);
+	const badEnv = resolveManagerOptions({ logRoot: "/x", onTerminal() {}, env: { PI_JOBS_MAX_RUNNING: "0", PI_JOBS_MAX_WATCHES: "lots" } });
+	assert.equal(badEnv.maxRunning, 8);
+	assert.equal(badEnv.maxRunningWatches, 32);
 });
 
 test("pruneLogs never follows symlinks out of the log root", t => {

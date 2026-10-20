@@ -75,6 +75,11 @@ export interface ManagerOptions {
 	 * job for the grace period.
 	 */
 	maxRunning?: number;
+	/**
+	 * Cap on running watches, counted separately from commands: a watch only runs a short check
+	 * every `intervalSeconds`, so watches are cheap and must not crowd out real commands (or each other).
+	 */
+	maxRunningWatches?: number;
 	/** Delay between SIGTERM and SIGKILL for a process group. */
 	killGraceMs?: number;
 	/** After a command's status is known, how long to wait for its output pipes to close. */
@@ -99,6 +104,7 @@ export interface ResolvedManagerOptions {
 	onTerminal: (job: JobSnapshot) => void;
 	onActiveChange: (active: boolean) => void;
 	maxRunning: number;
+	maxRunningWatches: number;
 	killGraceMs: number;
 	drainMs: number;
 	keepFinished: number;
@@ -108,6 +114,15 @@ export interface ResolvedManagerOptions {
 }
 
 export const DEFAULT_MAX_RUNNING = 8;
+export const DEFAULT_MAX_RUNNING_WATCHES = 32;
+
+/** A positive integer from the environment, or undefined. */
+function envLimit(env: NodeJS.ProcessEnv, name: string): number | undefined {
+	const raw = env[name];
+	if (raw === undefined || raw.trim() === "") return undefined;
+	const n = Number(raw);
+	return Number.isInteger(n) && n > 0 ? n : undefined;
+}
 export const DEFAULT_KILL_GRACE_MS = 5000;
 export const DEFAULT_DRAIN_MS = 1000;
 
@@ -116,17 +131,19 @@ export const DEFAULT_DRAIN_MS = 1000;
  * unset option) never replaces a default.
  */
 export function resolveManagerOptions(options: ManagerOptions): ResolvedManagerOptions {
+	const env = options.env ?? process.env;
 	return {
 		logRoot: options.logRoot,
 		onTerminal: options.onTerminal,
 		onActiveChange: options.onActiveChange ?? (() => {}),
-		maxRunning: options.maxRunning ?? DEFAULT_MAX_RUNNING,
+		maxRunning: options.maxRunning ?? envLimit(env, "PI_JOBS_MAX_RUNNING") ?? DEFAULT_MAX_RUNNING,
+		maxRunningWatches: options.maxRunningWatches ?? envLimit(env, "PI_JOBS_MAX_WATCHES") ?? DEFAULT_MAX_RUNNING_WATCHES,
 		killGraceMs: options.killGraceMs ?? DEFAULT_KILL_GRACE_MS,
 		drainMs: options.drainMs ?? DEFAULT_DRAIN_MS,
 		keepFinished: options.keepFinished ?? 50,
 		checkOutputBytes: options.checkOutputBytes ?? 64 * 1024,
 		logCapBytes: options.logCapBytes ?? DEFAULT_LOG_CAP_BYTES,
-		env: options.env ?? process.env,
+		env,
 	};
 }
 
@@ -307,9 +324,11 @@ export class JobManager {
 
 	private create(kind: JobKind, command: string, cwd: string, timeoutSeconds: number, label?: string): Job {
 		if (this.closed) throw new Error("The session is shutting down; no new background jobs.");
-		if (this.running.size >= this.opts.maxRunning)
+		const sameKind = [...this.running.values()].filter(j => j.snap.kind === kind).length;
+		const cap = kind === "watch" ? this.opts.maxRunningWatches : this.opts.maxRunning;
+		if (sameKind >= cap)
 			throw new Error(
-				`Too many running background jobs (${this.running.size}/${this.opts.maxRunning}). ` +
+				`Too many running background ${kind === "watch" ? "watches" : "jobs"} (${sameKind}/${cap}). ` +
 					"Wait for a completion notification or stop one with job_kill.",
 			);
 		let isDir = false;
