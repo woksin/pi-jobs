@@ -9,10 +9,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { randomUUID } from "node:crypto";
 import { isAbsolute, resolve } from "node:path";
-import { CUSTOM_TYPE, dedupeCompletions, Delivery, type Completion } from "./delivery.ts";
+import { CUSTOM_TYPE, dedupeCompletions, Delivery, type DeliveryHost, type Completion } from "./delivery.ts";
 import { formatBatch, formatJobList, formatJobLine, jobTitle } from "./format.ts";
 import { JobManager, type JobSnapshot } from "./jobs.ts";
 import { defaultLogRoot, pruneLogs } from "./logs.ts";
+import { highestJobId, sessionOwners, stopOrphans, type Owner } from "./ownership.ts";
 import type { WatchUntil } from "./watch.ts";
 
 export { CUSTOM_TYPE };
@@ -122,6 +123,7 @@ function result(textOut: string, details: unknown) {
 }
 
 interface SessionContext {
+	sessionManager?: { getSessionId(): string; getEntries(): readonly any[] };
 	isIdle?: () => boolean;
 	signal?: AbortSignal;
 	ui?: { notify?: (message: string, level: string) => void };
@@ -172,7 +174,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			if (ctx && typeof ctx === "object") ctxRef = ctx as SessionContext;
 		};
 
-		const delivery: Delivery<JobSnapshot> = new Delivery<JobSnapshot>({
+		const host: DeliveryHost<JobSnapshot> = {
 			isIdle: () => (typeof ctxRef?.isIdle === "function" ? ctxRef.isIdle() : true),
 			aborted: () => ctxRef?.signal?.aborted === true,
 			send: (deliveryId, completions) => {
@@ -196,9 +198,10 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 					ctxRef?.ui?.notify?.(`pi-jobs: session context is gone; completion of ${items.map(i => i.payload.id).join(", ")} was not delivered (see /jobs).`, "warning");
 				} catch {}
 			},
-		});
+		};
+		let delivery = new Delivery<JobSnapshot>(host);
 
-		const manager: JobManager = new JobManager({
+		let manager: JobManager = new JobManager({
 			logRoot,
 			maxRunning: options.maxRunning,
 			maxRunningWatches: options.maxRunningWatches,
@@ -213,6 +216,10 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			onTerminal: job => delivery.add({ completionId: randomUUID(), payload: job } satisfies Completion<JobSnapshot>),
 		});
 		options.onManager?.(manager);
+		const token = {};
+		let owner: Owner | undefined;
+		let sessionId: string | undefined;
+		let retired = false;
 
 		pi.on("agent_start", async (_e: unknown, ctx: unknown) => {
 			remember(ctx);
@@ -242,14 +249,49 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			return messages ? { messages } : undefined;
 		});
 
-		pi.on("session_start", async (_e: unknown, ctx: unknown) => {
+		pi.on("session_start", async (event, ctx) => {
 			remember(ctx);
+			sessionId = ctx.sessionManager?.getSessionId();
+			const owners = sessionOwners();
+			if (sessionId) {
+				const previous = owners.get(sessionId);
+				if (event.reason === "reload" && previous && !previous.token) {
+					manager = previous.manager;
+					delivery.dispose();
+					delivery = previous.delivery;
+					options.onManager?.(manager);
+					ctxRef?.ui?.notify?.(`pi-jobs: re-adopted session ${sessionId}; job ids, watch loops and deadlines preserved (${manager.list().filter(j => j.status === "running").map(j => j.id).join(", ") || "no running jobs"}).`, "info");
+				} else if (event.reason === "reload" && !previous && highestJobId(ctx.sessionManager.getEntries()) > 0) {
+					ctxRef?.ui?.notify?.("pi-jobs: no reload handoff exists for this session. Earlier jobs/watches cannot be re-adopted (the old version may have stopped them); inspect their recorded log paths. Id numbering will continue from session history.", "warning");
+				}
+				owner = { manager, delivery, token, alive: () => {
+					try { return typeof ctx.isIdle === "function" ? (ctx.isIdle(), true) : undefined; }
+					catch (error) { return /stale.*(?:session|runtime)/i.test(String(error)) ? false : undefined; }
+				} };
+				owners.set(sessionId, owner);
+				manager.advanceSequence(highestJobId(ctx.sessionManager.getEntries()));
+			}
+			delivery.rebind(host);
+			for (const notice of await stopOrphans(owners)) ctxRef?.ui?.notify?.(notice, "warning");
+			for (const [id, pending] of owners) {
+				if (!pending.token) ctxRef?.ui?.notify?.(`pi-jobs: session ${id} is awaiting reload handoff; ownership is unknown, so its jobs/watches were not stopped.`, "warning");
+			}
 			try {
 				pruneLogs(logRoot);
 			} catch {}
 		});
 
-		pi.on("session_shutdown", async () => {
+		pi.on("session_shutdown", async event => {
+			if (retired) return;
+			if (event.reason === "reload" && owner && sessionId) {
+				// Timers belong to Node, not the extension runtime. Keep their one manager
+				// (including watch options/baseline/deadline), pipes and supervisors alive.
+				delivery.suspend();
+				owner.token = undefined;
+				retired = true;
+				return;
+			}
+			if (sessionId && sessionOwners().get(sessionId)?.token === token) sessionOwners().delete(sessionId);
 			delivery.dispose();
 			try {
 				await manager.shutdown();

@@ -79,7 +79,7 @@ jobs finished:`). The output of all completions in a message shares a 16 KB budg
 
 **Terminal states.** `succeeded`, `failed` (non-zero exit or spawn failure), `timed_out`,
 `matched` (watch) and `killed`. There is **no message** for jobs stopped by
-`job_kill`/`/jobs kill` (the caller gets the final state synchronously) or by session shutdown
+`job_kill`/`/jobs kill` (the caller gets the final state synchronously) or by non-reload session shutdown
 (nobody to wake).
 
 ### Guarantee
@@ -116,8 +116,21 @@ message. Messages from older pi-jobs versions without part indices can only be s
 whole. Job handles such as `j1` restart in every session and are never used for
 deduplication.
 
-**Stale context.** If pi throws (after reload or session replacement), the failure is treated as
-permanent: delivery stops, the loss is reported once, and nothing is retried.
+**Reload.** On `session_shutdown` with reason `reload`, the session's manager is retained in a
+process-wide registry. Node timers do not belong to the extension runtime: the single watch loop,
+check/interval/until definition, change baseline and original deadline stay alive with it, as do
+command supervisors and logs. Completion delivery is suspended until the replacement extension
+rebinds its API at `session_start` (`reload`). Job ids are unchanged; numbering advances past
+session history. Unconfirmed follow-ups may be resent with the same completion ids (deduplicated
+in context as above). No subprocess is relaunched and no second watch loop is created.
+
+A stale attached runtime proves an owner is gone: its jobs/watches are stopped and reported
+with log paths. Another live session is never stopped; a pending reload handoff is unknown,
+reported but not killed. This is **same-process reload**, not restart/crash recovery. Old versions
+that shut down jobs cannot hand them off: the replacement warns and preserves id numbering.
+
+**Unexpected stale context.** Outside the reload handoff, a throw remains permanent: delivery
+stops, the loss is reported once, and nothing is retried.
 
 ### Known pi-side limitations
 
@@ -155,13 +168,13 @@ in `test/agent-session.test.ts`:
   pipes close or after 1 s at most, then the pipes are destroyed: a descendant that escaped
   the group (`setsid`, double fork) and keeps stdout open cannot stall a job, a watch, a
   timeout or shutdown. Escaped processes themselves are out of reach by design.
-- Session shutdown (quit, reload, `/new`, resume, fork) stops all of the session's jobs
+- Non-reload session shutdown (quit, `/new`, resume, fork) stops all of the session's jobs
   (SIGTERM, ≤1.5 s, then SIGKILL). One process-wide `process.on("exit")` hook SIGKILLs
   anything left if pi exits without a shutdown event; a session is registered with it only
   while it owns running jobs or pending SIGKILLs (and until its shutdown has finished).
 - A job whose log cannot be opened or whose spawn fails synchronously (e.g. a NUL byte) is
   rolled back and the tool call fails; it never occupies a slot.
-- Shutdown also destroys every pipe and clears every timer.
+- Non-reload shutdown also destroys every pipe and clears every timer.
 
 ## Limits
 
@@ -186,7 +199,7 @@ in `test/agent-session.test.ts`:
   byte cap holds after decoding (invalid UTF-8 cannot inflate it). A watch keeps at most
   64 KB of one check's output in memory, even when the check writes larger chunks.
 - The 50 most recent finished jobs are kept for `job_list`/`job_output`; state is in memory
-  only (not restored after reload/resume).
+  only (retained across same-process reload, not restored after restart/resume).
 
 ## Logs
 
@@ -201,7 +214,8 @@ skipped, and every path must resolve inside the log root.
 Each extension instance (main session, each subagent session) has its own JobManager: ids,
 jobs and notifications are per session. A job started by a subagent wakes that subagent; if
 the subagent session has already ended, its jobs were stopped at its shutdown (or, if the host
-disposes it without a shutdown event, they run to their timeout and the message is dropped —
+disposes it without a shutdown event, a later session start stops and reports its jobs once
+the runtime is provably stale; otherwise they run to timeout and the message is dropped —
 the exit hook still kills them when pi exits). Do not hand a subagent's job id to the parent.
 
 In print mode (`pi -p`) the run ends when the agent goes idle and the shutdown kills running

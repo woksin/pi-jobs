@@ -193,6 +193,11 @@ export class JobManager {
 		this.opts = resolveManagerOptions(options);
 	}
 
+	/** Never reuse an id already present in this session, including pruned history. */
+	advanceSequence(highest: number): void {
+		this.seq = Math.max(this.seq, highest);
+	}
+
 	get runningCount(): number {
 		return this.running.size;
 	}

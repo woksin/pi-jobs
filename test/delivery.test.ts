@@ -233,3 +233,25 @@ test("context filter: a message without part indices can only be stubbed as a wh
 	assert.deepEqual(texts(out[1]), ["u1,u2"], "cannot split an unindexed message");
 	assert.deepEqual(texts(out[2]), [DUPLICATE_STUB]);
 });
+
+test("reload suspends stale API calls and rebinds held and unconfirmed completions", () => {
+	const { state, d, c } = host();
+	state.idle = false;
+	d.onAgentStart();
+	d.add(c("unconfirmed"));
+	d.onAgentEnd();
+	d.add(c("held"));
+	d.suspend();
+	state.stale = true;
+	d.add(c("during-reload"));
+	d.onAgentStart();
+	d.onAgentEnd();
+	d.onAgentSettled();
+	d.onBusyEnd(true);
+	assert.equal(state.sends.length, 1);
+	assert.equal(d.disposed, false);
+	const received: string[][] = [];
+	d.rebind({ isIdle: () => true, aborted: () => false, send: (_id, items) => { received.push(items.map(i => i.completionId)); } });
+	assert.deepEqual(received, [["unconfirmed"], ["held", "during-reload"]]);
+	assert.equal(state.lost.length, 0);
+});

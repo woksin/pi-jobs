@@ -1,6 +1,7 @@
 /** End-to-end through the registered tools with a fake ExtensionAPI and real processes. */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createJobsExtension, CUSTOM_TYPE, liveManagers } from "../src/extension.ts";
@@ -14,17 +15,17 @@ interface Sent {
 	options: { triggerTurn?: boolean; deliverAs?: string };
 }
 
-function fakePi(throwOnSend = false) {
+function fakePi(throwOnSend = false, sessionId = randomUUID(), entries: any[] = []) {
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, ((...a: any[]) => any)[]>();
 	const sent: Sent[] = [];
 	const notes: { text: string; level: string }[] = [];
 	// Session state as pi would report it; startRunOnSend mimics pi starting a run on send.
-	const state = { idle: true, startRunOnSend: false };
+	const state = { idle: true, startRunOnSend: false, stale: false };
 	const ui = { notify: (text: string, level: string) => notes.push({ text, level }) };
 	const signal = new AbortController().signal;
-	const ctxFor = (cwd: string) => ({ cwd, ui, signal, isIdle: () => state.idle });
+	const ctxFor = (cwd: string) => ({ cwd, ui, signal, isIdle: () => { if (state.stale) throw new Error("stale runtime"); return state.idle; }, sessionManager: { getSessionId: () => sessionId, getEntries: () => entries } });
 	const pi = {
 		registerTool: (tool: any) => tools.set(tool.name, tool),
 		registerCommand: (name: string, cmd: any) => commands.set(name, cmd),
@@ -404,4 +405,81 @@ test("tool schemas enforce the bounds through pi's own argument validation", { s
 	bad("job_output", { id: "j1", tailLines: 201 });
 	bad("job_output", { id: "j1", tailLines: 0 });
 	assert.match(tools.get("job_watch").parameters.properties.checkTimeoutSeconds.description, /Default: min\(120, timeoutSeconds\)/);
+});
+
+
+test("reload adopts a running command and watch, preserves ids and delivers through the new API", async t => {
+	const dir = tempDir(t);
+	const id = randomUUID();
+	const old = fakePi(false, id);
+	const next = fakePi(false, id);
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, minIntervalSeconds: 0.05 };
+	createJobsExtension(options)(old.pi as any);
+	await old.emit("session_start", { reason: "startup" });
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	const command = await old.call("job_start", { command: "while [ ! -f done ]; do sleep 0.02; done; echo completed", timeoutSeconds: 10 }, dir);
+	const watch = await old.call("job_watch", { check: "test -f ready", intervalSeconds: 0.05, timeoutSeconds: 10 }, dir);
+	await old.emit("session_shutdown", { reason: "reload" });
+	writeFileSync(join(dir, "done"), "");
+	await sleep(150); // completion during the reload gap must be buffered
+	assert.equal(old.sent.length, 0);
+	createJobsExtension(options)(next.pi as any);
+	await next.emit("session_start", { reason: "reload" });
+	const listed = await next.call("job_list", {}, dir);
+	assert.deepEqual(listed.details.jobs.map((j: any) => j.id).sort(), [command.details.id, watch.details.id].sort());
+	writeFileSync(join(dir, "ready"), "");
+	await waitUntil(() => next.sent.flatMap(s => s.message.details.completions).length === 2);
+	assert.deepEqual(next.sent.flatMap(s => s.message.details.completions).map((c: any) => c.job.status).sort(), ["matched", "succeeded"]);
+	assert.equal(old.sent.length, 0);
+	const third = await next.call("job_start", { command: "sleep 1", timeoutSeconds: 5 }, dir);
+	assert.equal(third.details.id, "j3");
+	assert.match(next.notes[0].text, /re-adopted/);
+});
+
+test("reload keeps a watch's original deadline and change baseline", async t => {
+	const dir = tempDir(t), id = randomUUID();
+	const old = fakePi(false, id), next = fakePi(false, id);
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, minIntervalSeconds: 0.05 };
+	createJobsExtension(options)(old.pi as any);
+	await old.emit("session_start", { reason: "startup" });
+	await old.call("job_watch", { check: "echo unchanged", until: "change", intervalSeconds: 0.05, timeoutSeconds: 1 }, dir);
+	await sleep(650);
+	await old.emit("session_shutdown", { reason: "reload" });
+	createJobsExtension(options)(next.pi as any);
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	await next.emit("session_start", { reason: "reload" });
+	await waitUntil(() => next.sent.length === 1, 800, "original watch deadline");
+	assert.equal(next.sent[0].message.details.completions[0].job.status, "timed_out");
+});
+
+test("history continues numbering when no manager can be adopted", async t => {
+	const dir = tempDir(t);
+	const fake = fakePi(false, randomUUID(), [
+		{ type: "message", message: { role: "toolResult", toolName: "job_start", details: { id: "j544" } } },
+	]);
+	createJobsExtension({ logRoot: join(dir, "logs"), killGraceMs: 50 })(fake.pi as any);
+	t.after(() => fake.emit("session_shutdown", { reason: "quit" }));
+	await fake.emit("session_start", { reason: "reload" });
+	const result = await fake.call("job_start", { command: "sleep 1", timeoutSeconds: 5 }, dir);
+	assert.equal(result.details.id, "j545");
+});
+
+
+test("session_start reports and stops proven orphan watches, not another live session", async t => {
+	const dir = tempDir(t);
+	const old = fakePi(), live = fakePi(), next = fakePi();
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, minIntervalSeconds: 0.05 };
+	for (const fake of [old, live, next]) {
+		createJobsExtension(options)(fake.pi as any);
+		t.after(() => fake.emit("session_shutdown", { reason: "quit" }));
+	}
+	await old.emit("session_start", { reason: "startup" });
+	await live.emit("session_start", { reason: "startup" });
+	await old.call("job_watch", { check: "sleep 30", intervalSeconds: 0.05, timeoutSeconds: 60 }, dir);
+	await live.call("job_watch", { check: "false", intervalSeconds: 0.05, timeoutSeconds: 60 }, dir);
+	old.state.stale = true; // runtime invalidated without a shutdown handler
+	await next.emit("session_start", { reason: "reload" });
+	assert.match(next.notes[0].text, /owner session .* is gone; stopped orphaned watch j1.*log:/);
+	assert.equal((await old.call("job_list", {}, dir)).details.jobs[0].status, "killed");
+	assert.equal((await live.call("job_list", {}, dir)).details.jobs[0].status, "running");
 });
