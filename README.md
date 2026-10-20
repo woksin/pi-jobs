@@ -166,7 +166,10 @@ in `test/agent-session.test.ts`:
 ## Limits
 
 - `timeoutSeconds` 1–14400 (4 h), required. `intervalSeconds` 10–3600.
-- At most 8 running jobs + watches per session; more → tool error.
+- Commands (`job_start`) and watches (`job_watch`) have separate caps per session: at most 8 running
+  commands and 32 running watches; more of either → tool error. Watches only run a short check per
+  interval, so they never take command slots. Override with `PI_JOBS_MAX_RUNNING` and
+  `PI_JOBS_MAX_WATCHES` (positive integers; anything else falls back to the default).
   - A finished job's supervisor may stay alive for up to 5 s (the grace period) while it cleans
     up its group, and it is not counted.
   - During that window, leftover user processes that ignore SIGTERM can still run, until the

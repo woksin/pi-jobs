@@ -243,6 +243,7 @@ test("production defaults through the adapter: 8-job cap and 5000 ms kill grace"
 	assert.ok(ours, "manager owning running jobs must be in the exit-hook set");
 	assert.equal(ours.opts.killGraceMs, 5000);
 	assert.equal(ours.opts.maxRunning, 8);
+	assert.equal(ours.opts.maxRunningWatches, 32);
 });
 
 test("manager stays in the exit-hook set until shutdown has finished", async t => {
