@@ -49,7 +49,9 @@ export interface DeliveryHost<T> {
 }
 
 export class Delivery<T> {
-	private readonly host: DeliveryHost<T>;
+	private host: DeliveryHost<T>;
+	private suspended = false;
+	private binding = 0;
 	private readonly newId: () => string;
 	private held: Completion<T>[] = [];
 	/** Unconfirmed follow-ups awaiting their single resend, one batch each. */
@@ -82,11 +84,11 @@ export class Delivery<T> {
 	}
 
 	onAgentStart(): void {
-		this.runActive = true;
+		if (!this.disposed && !this.suspended) this.runActive = true;
 	}
 
 	onAgentEnd(): void {
-		if (this.disposed || (this.held.length === 0 && this.recovery.length === 0)) return;
+		if (this.disposed || this.suspended || (this.held.length === 0 && this.recovery.length === 0)) return;
 		let aborted = true;
 		try {
 			aborted = this.host.aborted();
@@ -102,8 +104,8 @@ export class Delivery<T> {
 	 * started a compaction): deliver only if idle, otherwise wait for the end of that work.
 	 */
 	onAgentSettled(): void {
+		if (this.disposed || this.suspended) return;
 		this.runActive = false;
-		if (this.disposed) return;
 		for (const items of this.queued.values()) this.recovery.push(items); // kept separate, never merged
 		this.queued.clear();
 		this.drainIfIdle();
@@ -123,6 +125,28 @@ export class Delivery<T> {
 	/** message_end of one of our messages. */
 	confirm(deliveryId: string): void {
 		this.queued.delete(deliveryId);
+	}
+
+	/** Reload keeps completions, but must never call the stale extension API. */
+	suspend(): void {
+		this.binding++;
+		this.suspended = true;
+		this.runActive = false;
+		for (const items of this.queued.values()) this.recovery.push(items);
+		this.queued.clear();
+	}
+
+	/** The replacement extension supplies a fresh context and API before draining. */
+	rebind(host: DeliveryHost<T>): void {
+		this.host = host;
+		const binding = ++this.binding;
+		// Keep buffering until every extension's session_start handler has run.
+		this.suspended = true;
+		setImmediate(() => {
+			if (this.binding !== binding || this.disposed) return;
+			this.suspended = false;
+			this.drainIfIdle();
+		});
 	}
 
 	dispose(): void {
@@ -153,7 +177,7 @@ export class Delivery<T> {
 	 * synchronously stops the drain; the rest goes out at that run's agent_end.
 	 */
 	private drainIfIdle(): void {
-		while (!this.disposed && !this.runActive && this.pending && this.idle()) {
+		while (!this.disposed && !this.suspended && !this.runActive && this.pending && this.idle()) {
 			const recovered = this.recovery.shift();
 			this.send(recovered ?? this.held.splice(0), "idle");
 		}
