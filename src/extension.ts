@@ -13,7 +13,7 @@ import { CUSTOM_TYPE, dedupeCompletions, Delivery, type DeliveryHost, type Compl
 import { formatBatch, formatJobList, formatJobLine, jobTitle } from "./format.ts";
 import { JobManager, type JobSnapshot } from "./jobs.ts";
 import { defaultLogRoot, pruneLogs } from "./logs.ts";
-import { highestJobId, sessionOwners, stopOrphans, type Owner } from "./ownership.ts";
+import { expireReloadOwner, highestJobId, sessionOwners, stopOrphans, takeReloadOwner, type Owner } from "./ownership.ts";
 import type { WatchUntil } from "./watch.ts";
 
 export { CUSTOM_TYPE };
@@ -254,24 +254,26 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			sessionId = ctx.sessionManager?.getSessionId();
 			const owners = sessionOwners();
 			if (sessionId) {
-				const previous = owners.get(sessionId);
-				if (event.reason === "reload" && previous && !previous.token) {
+				const handoff = event.reason === "reload" ? await takeReloadOwner(sessionId) : {};
+				const previous = handoff.owner;
+				if (previous) {
 					manager = previous.manager;
 					delivery.dispose();
 					delivery = previous.delivery;
 					options.onManager?.(manager);
 					ctxRef?.ui?.notify?.(`pi-jobs: re-adopted session ${sessionId}; job ids, watch loops and deadlines preserved (${manager.list().filter(j => j.status === "running").map(j => j.id).join(", ") || "no running jobs"}).`, "info");
-				} else if (event.reason === "reload" && !previous && highestJobId(ctx.sessionManager.getEntries()) > 0) {
+				} else if (handoff.incompatible) {
+					ctxRef?.ui?.notify?.("pi-jobs: incompatible reload handoff; stopped the old jobs/watches instead of adopting them. Inspect their recorded log paths.", "warning");
+				} else if (event.reason === "reload" && !owners.has(sessionId) && highestJobId(ctx.sessionManager.getEntries()) > 0) {
 					ctxRef?.ui?.notify?.("pi-jobs: no reload handoff exists for this session. Earlier jobs/watches cannot be re-adopted (the old version may have stopped them); inspect their recorded log paths. Id numbering will continue from session history.", "warning");
 				}
-				owner = { manager, delivery, token, alive: () => {
+				owner = { version: 2, manager, delivery, token, alive: () => {
 					try { return typeof ctx.isIdle === "function" ? (ctx.isIdle(), true) : undefined; }
 					catch (error) { return /stale.*(?:session|runtime)/i.test(String(error)) ? false : undefined; }
 				} };
 				owners.set(sessionId, owner);
 				manager.advanceSequence(highestJobId(ctx.sessionManager.getEntries()));
 			}
-			delivery.rebind(host);
 			for (const notice of await stopOrphans(owners)) ctxRef?.ui?.notify?.(notice, "warning");
 			for (const [id, pending] of owners) {
 				if (!pending.token) ctxRef?.ui?.notify?.(`pi-jobs: session ${id} is awaiting reload handoff; ownership is unknown, so its jobs/watches were not stopped.`, "warning");
@@ -279,6 +281,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			try {
 				pruneLogs(logRoot);
 			} catch {}
+			delivery.rebind(host);
 		});
 
 		pi.on("session_shutdown", async event => {
@@ -288,6 +291,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 				// (including watch options/baseline/deadline), pipes and supervisors alive.
 				delivery.suspend();
 				owner.token = undefined;
+				expireReloadOwner(sessionId, owner);
 				retired = true;
 				return;
 			}

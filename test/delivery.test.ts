@@ -234,7 +234,7 @@ test("context filter: a message without part indices can only be stubbed as a wh
 	assert.deepEqual(texts(out[2]), [DUPLICATE_STUB]);
 });
 
-test("reload suspends stale API calls and rebinds held and unconfirmed completions", () => {
+test("reload suspends stale API calls and rebinds held and unconfirmed completions", async () => {
 	const { state, d, c } = host();
 	state.idle = false;
 	d.onAgentStart();
@@ -252,6 +252,21 @@ test("reload suspends stale API calls and rebinds held and unconfirmed completio
 	assert.equal(d.disposed, false);
 	const received: string[][] = [];
 	d.rebind({ isIdle: () => true, aborted: () => false, send: (_id, items) => { received.push(items.map(i => i.completionId)); } });
+	assert.deepEqual(received, []); // Other session_start handlers run before this drain.
+	await new Promise(resolve => setImmediate(resolve));
 	assert.deepEqual(received, [["unconfirmed"], ["held", "during-reload"]]);
 	assert.equal(state.lost.length, 0);
+});
+
+
+test("a deferred rebind cannot resume a second reload handoff", async () => {
+	const { d, c } = host();
+	d.suspend();
+	d.add(c("pending"));
+	let sends = 0;
+	d.rebind({ isIdle: () => true, aborted: () => false, send: () => { sends++; } });
+	d.suspend();
+	await new Promise(resolve => setImmediate(resolve));
+	assert.equal(sends, 0);
+	d.dispose();
 });

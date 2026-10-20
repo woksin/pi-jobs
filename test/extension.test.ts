@@ -424,6 +424,7 @@ test("reload adopts a running command and watch, preserves ids and delivers thro
 	await sleep(150); // completion during the reload gap must be buffered
 	assert.equal(old.sent.length, 0);
 	createJobsExtension(options)(next.pi as any);
+	next.pi.on("session_start", () => assert.equal(next.sent.length, 0, "later extension initializes before triggerTurn"));
 	await next.emit("session_start", { reason: "reload" });
 	const listed = await next.call("job_list", {}, dir);
 	assert.deepEqual(listed.details.jobs.map((j: any) => j.id).sort(), [command.details.id, watch.details.id].sort());

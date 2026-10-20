@@ -51,6 +51,7 @@ export interface DeliveryHost<T> {
 export class Delivery<T> {
 	private host: DeliveryHost<T>;
 	private suspended = false;
+	private binding = 0;
 	private readonly newId: () => string;
 	private held: Completion<T>[] = [];
 	/** Unconfirmed follow-ups awaiting their single resend, one batch each. */
@@ -128,6 +129,7 @@ export class Delivery<T> {
 
 	/** Reload keeps completions, but must never call the stale extension API. */
 	suspend(): void {
+		this.binding++;
 		this.suspended = true;
 		this.runActive = false;
 		for (const items of this.queued.values()) this.recovery.push(items);
@@ -137,8 +139,14 @@ export class Delivery<T> {
 	/** The replacement extension supplies a fresh context and API before draining. */
 	rebind(host: DeliveryHost<T>): void {
 		this.host = host;
-		this.suspended = false;
-		this.drainIfIdle();
+		const binding = ++this.binding;
+		// Keep buffering until every extension's session_start handler has run.
+		this.suspended = true;
+		setImmediate(() => {
+			if (this.binding !== binding || this.disposed) return;
+			this.suspended = false;
+			this.drainIfIdle();
+		});
 	}
 
 	dispose(): void {

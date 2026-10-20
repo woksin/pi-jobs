@@ -120,13 +120,17 @@ deduplication.
 process-wide registry. Node timers do not belong to the extension runtime: the single watch loop,
 check/interval/until definition, change baseline and original deadline stay alive with it, as do
 command supervisors and logs. Completion delivery is suspended until the replacement extension
-rebinds its API at `session_start` (`reload`). Job ids are unchanged; numbering advances past
+rebinds its API at `session_start` (`reload`); delivery resumes on the next `setImmediate`,
+after other extensions can initialize. Job ids are unchanged; numbering advances past
 session history. Unconfirmed follow-ups may be resent with the same completion ids (deduplicated
 in context as above). No subprocess is relaunched and no second watch loop is created.
 
 A stale attached runtime proves an owner is gone: its jobs/watches are stopped and reported
 with log paths. Another live session is never stopped; a pending reload handoff is unknown,
-reported but not killed. This is **same-process reload**, not restart/crash recovery. Old versions
+reported and kept for at most five minutes. An unref'd handoff timer then stops its jobs/watches
+and logs the expiry if no replacement adopts it. A versioned registry and method checks reject
+incompatible handoffs and stop their work instead of adopting it. This is **same-process reload**,
+not restart/crash recovery. Old versions
 that shut down jobs cannot hand them off: the replacement warns and preserves id numbering.
 
 **Unexpected stale context.** Outside the reload handoff, a throw remains permanent: delivery
