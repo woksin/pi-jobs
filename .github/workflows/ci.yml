@@ -23,6 +23,6 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - name: Install the pi runtime the tests run against
-        run: npm install --no-save --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.1.0
+        run: npm install --no-save --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@1.3.0
       - run: npm test
       - run: npm pack --dry-run

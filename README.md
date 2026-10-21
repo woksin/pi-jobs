@@ -22,7 +22,7 @@ pi install /path/to/pi-jobs
 ```
 
 Restart Pi or run `/reload` after changing settings. Requires a POSIX system with Bash;
-Windows is not supported. Tested with Pi 1.1.0. The host dependency uses `"*"` as recommended
+Windows is not supported. Tested with Pi 1.3.0. The host dependency uses `"*"` as recommended
 for Pi packages: Pi supplies its own runtime and suppresses automatic peer installation
 for managed packages. Other runtime versions are not guaranteed.
 
