@@ -1,6 +1,6 @@
 {
   "name": "@woksin/pi-jobs",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Background shell jobs and watches that wake the pi agent on completion",
   "license": "MIT",
   "author": "woksin",
