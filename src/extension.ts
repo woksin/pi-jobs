@@ -13,7 +13,7 @@ import { CUSTOM_TYPE, dedupeCompletions, Delivery, type DeliveryHost, type Compl
 import { formatBatch, formatJobList, formatJobLine, jobTitle } from "./format.ts";
 import { JobManager, type JobSnapshot } from "./jobs.ts";
 import { defaultLogRoot, pruneLogs } from "./logs.ts";
-import { expireReloadOwner, highestJobId, sessionOwners, stopOrphans, takeReloadOwner, type Owner } from "./ownership.ts";
+import { expireReloadOwner, highestJobId, historicalRunningJobs, sessionOwners, stopOrphans, takeReloadOwner, type Owner } from "./ownership.ts";
 import type { WatchUntil } from "./watch.ts";
 
 export { CUSTOM_TYPE };
@@ -221,6 +221,18 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 		let sessionId: string | undefined;
 		let retired = false;
 
+		const reportReloadLoss = (jobs: JobSnapshot[]) => {
+			for (const job of jobs) {
+				const message = `pi-jobs: ${job.kind} ${job.id}${job.label ? ` (${job.label})` : ""} was not adopted. Last recorded as running; it may have finished or been stopped by the old version. Check before re-arming.\n` +
+					`command: ${job.command}\ncwd: ${job.cwd}\nlog: ${job.logPath}\n` +
+					`timeoutSeconds: ${job.timeoutSeconds}${job.kind === "watch" ? `; until: ${job.until}; intervalSeconds: ${job.intervalSeconds ?? "not recorded by old version"}` : ""}`;
+				ctxRef?.ui?.notify?.(message, "warning");
+				// UI notifications alone are not model context. Persist the full command without
+				// starting a turn while other session_start handlers are still initializing.
+				pi.sendMessage({ customType: "pi-jobs-reload", content: message, display: true, details: { unadopted: job } }, { triggerTurn: false });
+			}
+		};
+
 		pi.on("agent_start", async (_e: unknown, ctx: unknown) => {
 			remember(ctx);
 			delivery.onAgentStart();
@@ -264,8 +276,10 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 					ctxRef?.ui?.notify?.(`pi-jobs: re-adopted session ${sessionId}; job ids, watch loops and deadlines preserved (${manager.list().filter(j => j.status === "running").map(j => j.id).join(", ") || "no running jobs"}).`, "info");
 				} else if (handoff.incompatible) {
 					ctxRef?.ui?.notify?.("pi-jobs: incompatible reload handoff; stopped the old jobs/watches instead of adopting them. Inspect their recorded log paths.", "warning");
+					reportReloadLoss(handoff.dropped?.length ? handoff.dropped : historicalRunningJobs(ctx.sessionManager.getEntries()));
 				} else if (event.reason === "reload" && !owners.has(sessionId) && highestJobId(ctx.sessionManager.getEntries()) > 0) {
 					ctxRef?.ui?.notify?.("pi-jobs: no reload handoff exists for this session. Earlier jobs/watches cannot be re-adopted (the old version may have stopped them); inspect their recorded log paths. Id numbering will continue from session history.", "warning");
+					reportReloadLoss(historicalRunningJobs(ctx.sessionManager.getEntries()));
 				}
 				owner = { version: 2, manager, delivery, token, alive: () => {
 					try { return typeof ctx.isIdle === "function" ? (ctx.isIdle(), true) : undefined; }

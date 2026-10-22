@@ -132,6 +132,15 @@ and logs the expiry if no replacement adopts it. A versioned registry and method
 incompatible handoffs and stop their work instead of adopting it. This is **same-process reload**,
 not restart/crash recovery. Old versions
 that shut down jobs cannot hand them off: the replacement warns and preserves id numbering.
+In particular, upgrading an already-loaded pre-0.2 runtime cannot preserve its jobs: its old
+shutdown handler runs before the updated extension loads. A missing or incompatible handoff
+now reports each affected item's full command, cwd, log and recorded watch settings, both in the
+UI and in session/model context, without starting a turn. Missing-handoff reports use the last
+recorded running state, not proof that the item was still alive; inspect the logs before
+re-arming. An old snapshot may lack an interval, which the notice explicitly marks as unknown.
+Compatible handoffs do not require that optional snapshot field and are still adopted without
+restarting commands or watches. Recovery notices do not automatically restart work or restore
+an already-stopped process.
 
 **Unexpected stale context.** Outside the reload handoff, a throw remains permanent: delivery
 stops, the loss is reported once, and nothing is retried.

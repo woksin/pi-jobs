@@ -8,7 +8,8 @@ import { createJobsExtension, CUSTOM_TYPE, liveManagers } from "../src/extension
 import { piAiEntry, runtimeDirectory } from "./runtime.ts";
 import defaultExtension from "../src/extension.ts";
 import { alive, readPid, sleep, tempDir, waitUntil } from "./helpers.ts";
-import type { JobManager } from "../src/jobs.ts";
+import { JobManager } from "../src/jobs.ts";
+import { sessionOwners } from "../src/ownership.ts";
 
 interface Sent {
 	message: { customType: string; content: { type: string; text: string }[]; display: boolean; details: any };
@@ -451,6 +452,82 @@ test("reload keeps a watch's original deadline and change baseline", async t => 
 	await next.emit("session_start", { reason: "reload" });
 	await waitUntil(() => next.sent.length === 1, 800, "original watch deadline");
 	assert.equal(next.sent[0].message.details.completions[0].job.status, "timed_out");
+});
+
+test("a legacy upgrade that stops work without a handoff reports every full command in model context", async t => {
+	const dir = tempDir(t), id = randomUUID();
+	const entries: any[] = [];
+	const old = fakePi(false, id, entries), next = fakePi(false, id, entries);
+	const manager = new JobManager({ logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, onTerminal: () => {} });
+	t.after(() => manager.shutdown());
+	// The pre-0.2 extension's shutdown handler ignored the reason (4011ae7:252-260).
+	// Its manager was never registered in sessionOwners, so new code cannot resurrect it.
+	old.pi.on("session_shutdown", async () => manager.shutdown());
+	const command = manager.start({ command: "while [ ! -f done ]; do sleep 0.02; done", cwd: dir, timeoutSeconds: 10 });
+	const watch = manager.watch({ check: `echo '${"full command ".repeat(100)}'; false`, cwd: dir, intervalSeconds: 0.05, timeoutSeconds: 10, checkTimeoutSeconds: 1, until: "success" });
+	for (const job of [command, watch]) entries.push({ type: "message", message: { role: "toolResult", toolName: job.kind === "watch" ? "job_watch" : "job_start", details: job } });
+	await old.emit("session_shutdown", { reason: "reload" });
+	assert.equal(manager.get(command.id)?.status, "killed");
+	assert.equal(manager.get(watch.id)?.status, "killed");
+	assert.equal(sessionOwners().has(id), false);
+	createJobsExtension({ logRoot: join(dir, "logs") })(next.pi as any);
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	await next.emit("session_start", { reason: "reload" });
+	assert.deepEqual((await next.call("job_list", {}, dir)).details.jobs, []);
+	assert.equal(next.sent.length, 2);
+	for (const [i, job] of [command, watch].entries()) {
+		const notice = next.sent[i];
+		assert.equal(notice.message.customType, "pi-jobs-reload");
+		assert.equal(notice.message.display, true);
+		assert.equal(notice.options.triggerTurn, false);
+		assert.ok(String(notice.message.content).includes(`command: ${job.command}\n`));
+		assert.ok(next.notes.some(note => note.text.includes(job.command) && note.text.includes(job.cwd) && note.text.includes(job.logPath)));
+		assert.equal(notice.message.details.unadopted.id, job.id);
+	}
+});
+
+test("incompatible handoff reports running items before stopping them", async t => {
+	const dir = tempDir(t), id = randomUUID();
+	const old = fakePi(false, id), next = fakePi(false, id);
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, minIntervalSeconds: 0.05 };
+	createJobsExtension(options)(old.pi as any);
+	await old.emit("session_start", { reason: "startup" });
+	const watch = await old.call("job_watch", { check: "echo incompatible; false", intervalSeconds: 0.05, timeoutSeconds: 10 }, dir);
+	await old.emit("session_shutdown", { reason: "reload" });
+	const owner = sessionOwners().get(id)!;
+	(owner as any).version = 999;
+	createJobsExtension(options)(next.pi as any);
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	await next.emit("session_start", { reason: "reload" });
+	assert.equal(owner.manager.get(watch.details.id)?.status, "killed");
+	assert.equal(next.sent.length, 1);
+	assert.ok(String(next.sent[0].message.content).includes(watch.details.command));
+});
+
+test("a replacement module adopts compatible older snapshots without intervalSeconds", async t => {
+	const dir = tempDir(t), id = randomUUID();
+	const old = fakePi(false, id), next = fakePi(false, id);
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, minIntervalSeconds: 0.05 };
+	createJobsExtension(options)(old.pi as any);
+	await old.emit("session_start", { reason: "startup" });
+	const command = await old.call("job_start", { command: "while [ ! -f done ]; do sleep 0.02; done", timeoutSeconds: 10 }, dir);
+	const watch = await old.call("job_watch", { check: "test -f ready", intervalSeconds: 0.05, timeoutSeconds: 10 }, dir);
+	const manager = sessionOwners().get(id)!.manager;
+	const list = manager.list.bind(manager);
+	manager.list = () => list().map(({ intervalSeconds, ...snapshot }) => snapshot);
+	await old.emit("session_shutdown", { reason: "reload" });
+	const replacement = await import(`../src/extension.ts?replacement=${randomUUID()}`);
+	replacement.createJobsExtension(options)(next.pi as any);
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	await next.emit("session_start", { reason: "reload" });
+	assert.equal(sessionOwners().get(id)!.manager, manager);
+	assert.deepEqual((await next.call("job_list", {}, dir)).details.jobs.map((job: any) => job.id), [command.details.id, watch.details.id]);
+	assert.equal(next.sent.length, 0);
+	writeFileSync(join(dir, "done"), "");
+	writeFileSync(join(dir, "ready"), "");
+	await waitUntil(() => next.sent.flatMap(message => message.message.details.completions).length === 2);
+	assert.equal(old.sent.length, 0);
+	assert.deepEqual(next.sent.flatMap(message => message.message.details.completions).map(completion => completion.job.status).sort(), ["matched", "succeeded"]);
 });
 
 test("history continues numbering when no manager can be adopted", async t => {

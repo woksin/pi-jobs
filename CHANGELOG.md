@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+### Fixed
+- Missing or incompatible reload handoffs report each affected item's full command and recorded settings in both the UI and session/model context, rather than only a generic UI warning. Legacy runtimes that already stopped their work cannot be resurrected; compatible owners remain adoptable across code updates, including snapshots without the optional watch interval field.
+
 ## 0.3.0
 
 ### Added

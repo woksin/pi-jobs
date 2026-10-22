@@ -39,7 +39,7 @@ async function stopOwner(owner: any): Promise<void> {
 }
 
 /** Only this session's suspended owner may be adopted or retired as incompatible. */
-export async function takeReloadOwner(sessionId: string): Promise<{ owner?: Owner; incompatible?: boolean }> {
+export async function takeReloadOwner(sessionId: string): Promise<{ owner?: Owner; incompatible?: boolean; dropped?: JobSnapshot[] }> {
 	const owners = sessionOwners();
 	const legacy = (globalThis as any)[Symbol.for("pi-jobs.sessionOwners.v1")];
 	const source = owners.has(sessionId) ? owners : legacy instanceof Map ? legacy : undefined;
@@ -47,9 +47,10 @@ export async function takeReloadOwner(sessionId: string): Promise<{ owner?: Owne
 	if (!owner || owner.token) return {};
 	clearTimeout(owner.reloadTimer);
 	if (compatibleOwner(owner)) return { owner };
+	const dropped = typeof owner.manager?.list === "function" ? owner.manager.list().filter((job: JobSnapshot) => job.status === "running") : [];
 	source.delete(sessionId);
 	await stopOwner(owner);
-	return { incompatible: true };
+	return { incompatible: true, dropped };
 }
 
 /** Reload is a bounded handoff, not permission to leave work ownerless indefinitely. */
@@ -76,6 +77,25 @@ export async function stopOrphans(owners = sessionOwners()): Promise<string[]> {
 		if (jobs.length) notices.push(`pi-jobs: owner session ${sessionId} is gone; stopped orphaned ${jobs.map(job => `${job.kind} ${job.id} (log: ${job.logPath})`).join(", ")}.`);
 	}
 	return notices;
+}
+
+/** Last recorded state, not proof of liveness: old versions stopped work without recording it. */
+export function historicalRunningJobs(entries: readonly any[]): JobSnapshot[] {
+	const jobs = new Map<string, JobSnapshot>();
+	const record = (job: any) => {
+		if (typeof job?.id === "string" && typeof job.command === "string") jobs.set(job.id, job);
+	};
+	for (const entry of entries) {
+		const message = entry?.type === "message" ? entry.message : entry?.type === "custom_message" ? { ...entry, role: "custom" } : undefined;
+		if (message?.role === "toolResult" && ["job_start", "job_watch", "job_list", "job_output", "job_kill"].includes(message.toolName)) {
+			record(message.details);
+			for (const job of message.details?.jobs ?? []) record(job);
+		}
+		if (message?.role === "custom" && message.customType === CUSTOM_TYPE) {
+			for (const completion of message.details?.completions ?? []) record(completion?.job);
+		}
+	}
+	return [...jobs.values()].filter(job => job.status === "running");
 }
 
 /** Session history provides a high-water mark even when the old manager is unavailable. */
