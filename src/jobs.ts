@@ -35,6 +35,8 @@ export interface JobSnapshot {
 	/** Set when the job was stopped by kill() or shutdown(). */
 	killedBy?: "request" | "shutdown";
 	until?: WatchUntil;
+	/** Configured delay between watch checks; absent for plain commands. */
+	intervalSeconds?: number;
 	checks?: number;
 	lastCheck?: CheckResult;
 	/** The log hit its size cap; later output was discarded. */
@@ -225,6 +227,7 @@ export class JobManager {
 	watch(options: WatchOptions): JobSnapshot {
 		const job = this.create("watch", options.check, options.cwd, options.timeoutSeconds, options.label);
 		job.snap.until = options.until;
+		job.snap.intervalSeconds = options.intervalSeconds;
 		job.snap.checks = 0;
 		try {
 			job.log = new LogWriter(job.snap.logPath, this.opts.logCapBytes);

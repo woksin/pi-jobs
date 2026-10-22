@@ -369,3 +369,16 @@ test("log size cap: output beyond the cap is discarded, the job keeps running, t
 	assert.match(readFileSync(done[0].logPath, "utf8"), /\[pi-jobs: log truncated at 98 KB; further output is discarded, the job keeps running\]\n$/);
 	assert.equal(done[0].logTruncated, true);
 });
+
+
+test("list snapshots retain watch configuration additively and plain jobs have no watch fields", async t => {
+	const { dir, manager } = setup(t);
+	const watch = manager.watch({ ...watchDefaults, check: "false", cwd: dir, label: "ready", intervalSeconds: 3, timeoutSeconds: 30 });
+	const command = manager.start({ command: "sleep 10", cwd: dir, label: "build", timeoutSeconds: 20 });
+	const listed = manager.list();
+	assert.deepEqual(listed.find(j => j.id === watch.id), watch);
+	assert.deepEqual([watch.label, watch.until, watch.intervalSeconds, watch.timeoutSeconds], ["ready", "success", 3, 30]);
+	assert.deepEqual([command.label, command.timeoutSeconds, command.until, command.intervalSeconds], ["build", 20, undefined, undefined]);
+	listed[0].intervalSeconds = 99;
+	assert.equal(manager.list().find(j => j.id === watch.id)!.intervalSeconds, 3);
+});
