@@ -1,7 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
+### Added
 - Registry snapshots now include the configured watch `intervalSeconds`, alongside existing `label`, `until` and `timeoutSeconds` fields. Plain commands have no watch interval or until condition.
 
 ## 0.2.0
