@@ -1,8 +1,35 @@
 # pi-jobs
 
-Background shell jobs and watches for pi that **wake the agent when they finish**. Long waits
-(CI watches, long builds, "poll until X") run outside the model at zero token cost; the agent
-gets one concise message at the end.
+Background shell jobs and watches for pi that wake the agent when they finish.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![npm](https://img.shields.io/npm/v/@woksin/pi-jobs.svg)](https://www.npmjs.com/package/@woksin/pi-jobs) [![CI](https://img.shields.io/github/actions/workflow/status/woksin/pi-jobs/ci.yml?label=CI)](https://github.com/woksin/pi-jobs/actions/workflows/ci.yml)
+
+Long waits (CI runs, long builds, "poll until X") run outside the model at zero token cost. The agent starts the job, ends its turn, and gets one concise message when it is done.
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant J as pi-jobs
+    A->>J: job_start / job_watch
+    J-->>A: id + log path (returns at once)
+    Note over A: ends its turn, no polling
+    J->>A: one completion message (status, duration, log tail)
+```
+
+## Why
+
+- Polling CI from the model burns tokens on every check and fills the context.
+- A foreground wait blocks the session.
+- Several jobs finishing together should wake the agent once, not many times.
+
+## Features
+
+- `job_start` runs a command under a supervisor in its own process group, with a log file.
+- `job_watch` re-runs a check until it succeeds, fails or changes (`until`).
+- Completions are batched into one message with a bounded log tail.
+- `job_list`, `job_output` and `job_kill`, plus `/jobs` and `/jobs kill <id>` for you.
+- Logs are capped at 50 MB and old logs are cleaned up after 7 days.
+- Jobs survive `/reload`.
 
 ## Install
 
@@ -262,3 +289,14 @@ CI (`.github/workflows/ci.yml`) runs the tests on Node 22 and 24 for every push 
 ### Registry snapshots
 
 `manager.list()` returns additive job snapshots including `label`, `until`, `intervalSeconds` and `timeoutSeconds`. `until` and `intervalSeconds` are absent for plain commands; `label` is optional. The interval is the configured delay between checks, not a countdown.
+
+## Related projects
+
+- [pi-setup](https://github.com/woksin/pi-setup): my full pi agent setup (rules, agents, extensions, installer) that ties these together
+- [pi-recover](https://github.com/woksin/pi-recover): `/recover` picks up unfinished subagents, workflows and jobs after a crash or usage limit
+- [pi-context-budget](https://github.com/woksin/pi-context-budget): structured context handoffs and bounded long sessions
+- [pi-orch](https://github.com/woksin/pi-orch) (experimental): repo-owner orchestration with an order bus and batched candidate PRs
+
+## License
+
+MIT, see [LICENSE](LICENSE).
