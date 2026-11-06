@@ -20,6 +20,7 @@ const upstream = (n: number, what: string) => (available ? `pi-side race, see UP
 let providerSeq = 0;
 
 interface HarnessOptions {
+	subscriptions?: boolean;
 	/** Extra extension, loaded after pi-jobs (so its handlers run after ours). */
 	extra?: (pi: any) => void;
 	/** Extra extension, loaded before pi-jobs (so its handlers run before ours). */
@@ -41,7 +42,8 @@ async function harness(t: Parameters<typeof tempDir>[0], opts: HarnessOptions = 
 	/** Model contexts after all `context` handlers (what the model actually sees). */
 	const contexts: any[][] = [];
 	const recorder = (pi: any) => pi.on("context", async (e: any) => void contexts.push(e.messages));
-	const ext = createJobsExtension({ logRoot: join(dir, "logs"), killGraceMs: 300, drainMs: 200, onManager: m => (manager = m) });
+	const ext = createJobsExtension({ logRoot: join(dir, "logs"), subscriptions: opts.subscriptions, env: opts.subscriptions ? {} : undefined,
+		minIntervalSeconds: 0.05, killGraceMs: 300, drainMs: 200, onManager: m => (manager = m) });
 	const resourceLoader = new pc.DefaultResourceLoader({
 		cwd: dir,
 		agentDir,
@@ -67,12 +69,16 @@ async function harness(t: Parameters<typeof tempDir>[0], opts: HarnessOptions = 
 		sessionManager,
 		settingsManager,
 	});
+	const errors: unknown[] = [];
+	if (opts.subscriptions) await session.bindExtensions({ onError: (error: unknown) => errors.push(error) });
 	t.after(async () => {
 		try {
 			await session.abort();
 		} catch {}
+		if (opts.subscriptions) await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session.dispose();
 		await manager?.shutdown(200);
+		if (opts.subscriptions) assert.deepEqual(errors, []);
 	});
 	const completions = () => session.messages.filter((m: any) => m.role === "custom" && m.customType === CUSTOM_TYPE);
 	const assistantTexts = () =>
@@ -106,6 +112,82 @@ async function harness(t: Parameters<typeof tempDir>[0], opts: HarnessOptions = 
 	const open = (name: string) => writeFileSync(join(dir, name), "");
 	return { session, faux, ai, dir, manager: () => manager, completions, assistantTexts, maxSeen, blocking, reply, startJob, gated, open };
 }
+
+test("native subscription receipt resumes checks under one id without model rearm", { skip }, async t => {
+	const h = await harness(t, { subscriptions: true });
+	h.faux.setResponses([
+		h.ai.fauxAssistantMessage([h.ai.fauxToolCall("job_subscribe", {
+			check: "if test -e consumed; then exit 1; fi; touch consumed; echo FIRST-MATCH", lane: "L1", inboxDir: h.dir,
+			intervalSeconds: 0.05, timeoutSeconds: 10,
+		})], { stopReason: "toolUse" }), h.reply("started"), h.reply("woken"),
+	]);
+	await h.session.prompt("subscribe");
+	await waitUntil(() => h.completions().length === 1 && h.assistantTexts().includes("woken"), 10000, "subscription receipt");
+	assert.equal(h.completions()[0].details.completions[0].event, "match");
+	assert.equal(h.completions()[0].details.completions[0].job.status, "running");
+	assert.match(JSON.stringify(h.completions()[0].content), /FIRST-MATCH/);
+	await waitUntil(() => h.manager().get("j1")!.checks! >= 2);
+	assert.equal(h.manager().get("j1")!.status, "running");
+	assert.equal(h.maxSeen("FIRST-MATCH"), 1);
+	await h.manager().kill("j1");
+});
+
+test("native subscription reload gap retains capture and deadline with a fresh host", { skip }, async t => {
+	const h = await harness(t, { subscriptions: true });
+	h.faux.setResponses([
+		h.ai.fauxAssistantMessage([h.ai.fauxToolCall("job_subscribe", {
+			check: `if test -e consumed; then exit 1; fi; ${h.gated("go", "RELOAD-CAPTURE")}; touch consumed`, lane: "L1", inboxDir: h.dir,
+			intervalSeconds: 0.05, timeoutSeconds: 10,
+		})], { stopReason: "toolUse" }), h.reply("started"), h.reply("woken"),
+	]);
+	await h.session.prompt("subscribe");
+	const originalManager = h.manager();
+	const original = originalManager.get("j1")!;
+	await h.session.reload({ beforeSessionStart: async () => {
+		h.open("go");
+		await waitUntil(() => originalManager.get("j1")?.matchSequence === 1);
+		assert.equal(h.completions().length, 0);
+	} });
+	await waitUntil(() => h.completions().length === 1 && h.assistantTexts().includes("woken"), 10000, "post-reload match");
+	assert.match(JSON.stringify(h.completions()[0].content), /RELOAD-CAPTURE/);
+	assert.equal(h.manager().get("j1")!.deadline, original.deadline);
+	assert.equal(h.manager().get("j1")!.inboxDir, original.inboxDir);
+	assert.equal(h.maxSeen("RELOAD-CAPTURE"), 1);
+	await h.manager().kill("j1");
+});
+
+test("native subscription Escape preserves capture with one recovery, then resumes on receipt", { skip }, async t => {
+	let session: any;
+	let armed = false;
+	const escapeAfterQueue = (pi: any) => pi.on("agent_end", async () => {
+		if (armed) { armed = false; session.clearQueue(); }
+	});
+	const h = await harness(t, { subscriptions: true, extra: escapeAfterQueue });
+	session = h.session;
+	const busy = h.blocking();
+	h.faux.setResponses([
+		h.ai.fauxAssistantMessage([h.ai.fauxToolCall("job_subscribe", {
+			check: `if test -e consumed; then exit 1; fi; ${h.gated("go", "ESCAPE-CAPTURE")}; touch consumed`, lane: "L1", inboxDir: h.dir,
+			intervalSeconds: 0.05, timeoutSeconds: 10,
+		})], { stopReason: "toolUse" }), busy.step, ...[1, 2, 3].map(() => h.reply("woken")),
+	]);
+	const run = h.session.prompt("subscribe");
+	await busy.entered;
+	h.open("go");
+	await waitUntil(() => h.manager().get("j1")?.matchSequence === 1);
+	await sleep(100);
+	assert.equal(h.manager().get("j1")!.checks, 1);
+	armed = true;
+	busy.release();
+	await run;
+	await waitUntil(() => h.completions().length === 1 && h.assistantTexts().includes("woken"), 10000, "subscription recovery");
+	await waitUntil(() => h.manager().get("j1")!.checks! >= 2);
+	assert.equal(h.maxSeen("ESCAPE-CAPTURE"), 1);
+	await idle(h.session);
+	await sleep(300);
+	assert.equal(h.completions().length, 1);
+	await h.manager().kill("j1");
+});
 
 async function idle(session: any, ms = 5000) {
 	await waitUntil(() => session.isIdle, ms, "session idle");

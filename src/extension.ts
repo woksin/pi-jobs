@@ -15,6 +15,8 @@ import { JobManager, type JobSnapshot } from "./jobs.ts";
 import { defaultLogRoot, pruneLogs } from "./logs.ts";
 import { expireReloadOwner, highestJobId, historicalRunningJobs, sessionOwners, stopOrphans, takeReloadOwner, type Owner } from "./ownership.ts";
 import type { WatchUntil } from "./watch.ts";
+import { laneStatus } from "./subscription.ts";
+import { tailBuffer } from "./tail.ts";
 
 export { CUSTOM_TYPE };
 export const MAX_TIMEOUT_SECONDS = 4 * 3600;
@@ -30,6 +32,9 @@ export const OUTPUT_MAX_LINES = 200;
 export const OUTPUT_BYTES = 16 * 1024;
 
 export interface JobsExtensionOptions {
+	/** Off by default; production opt-in is PI_JOBS_SUBSCRIPTIONS=1. */
+	subscriptions?: boolean;
+	env?: NodeJS.ProcessEnv;
 	logRoot?: string;
 	maxRunning?: number;
 	maxRunningWatches?: number;
@@ -83,6 +88,17 @@ export function watchParams(minInterval = MIN_INTERVAL_SECONDS) {
 	};
 }
 
+export function subscribeParams(minInterval = MIN_INTERVAL_SECONDS) {
+	const watch = watchParams(minInterval);
+	const { until: _until, ...properties } = watch.properties;
+	return { ...watch, properties: { ...properties,
+		check: { type: "string", minLength: 1, description: "Trusted consuming inbox check: exit 0 match, 1 quiet, anything else stops with an error. Must honor the declared inboxDir/lane." },
+		lane: { type: "string", pattern: "^[A-Z][A-Z0-9-]{0,15}$", description: "Marker lane token; must agree with known lane identity." },
+		inboxDir: { type: "string", minLength: 1, description: "Existing declared inbox directory, canonicalized before admission and set as INBOX_DIR for checks." },
+		checkTimeoutSeconds: timeoutSchema("Per-check limit; timeout stops the subscription. Default: min(120, timeoutSeconds)."),
+	}, required: [...watch.required, "lane", "inboxDir"] };
+}
+
 const idParams = {
 	type: "object",
 	properties: { id: { type: "string", minLength: 1, description: "Job id, e.g. j3." } },
@@ -94,7 +110,7 @@ export const outputParams = {
 	type: "object",
 	properties: {
 		id: { type: "string", minLength: 1, description: "Job id, e.g. j3." },
-		tailLines: { type: "integer", minimum: 1, maximum: OUTPUT_MAX_LINES, description: `Lines from the end (default ${OUTPUT_DEFAULT_LINES}; at most ${OUTPUT_BYTES / 1024} KB).` },
+		tailLines: { type: "number", multipleOf: 1, minimum: 1, maximum: OUTPUT_MAX_LINES, description: `Lines from the end (default ${OUTPUT_DEFAULT_LINES}; at most ${OUTPUT_BYTES / 1024} KB).` },
 	},
 	required: ["id"],
 	additionalProperties: false,
@@ -166,6 +182,8 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 	return function jobsExtension(pi: ExtensionAPI): void {
 		const logRoot = options.logRoot ?? defaultLogRoot();
 		const minInterval = options.minIntervalSeconds ?? MIN_INTERVAL_SECONDS;
+		const env = options.env ?? process.env;
+		const subscriptions = options.subscriptions ?? env.PI_JOBS_SUBSCRIPTIONS === "1";
 
 		const live = liveManagers();
 		// Latest context seen (pi's contexts read live state; a stale one throws).
@@ -174,12 +192,17 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			if (ctx && typeof ctx === "object") ctxRef = ctx as SessionContext;
 		};
 
+		let shuttingDown = false;
 		const host: DeliveryHost<JobSnapshot> = {
 			isIdle: () => (typeof ctxRef?.isIdle === "function" ? ctxRef.isIdle() : true),
 			aborted: () => ctxRef?.signal?.aborted === true,
 			send: (deliveryId, completions) => {
 				const budget = tailBudget(completions.length);
-				const items = completions.map(c => ({ job: c.payload, tail: manager.notificationTail(c.payload, NOTIFY_LINES, budget) }));
+				const items = completions.map(c => {
+					const record = c.subscription?.record;
+					const tail = record ? tailBuffer(Buffer.from(record.capture?.data ?? "", "latin1"), NOTIFY_LINES, budget, !record.capture?.truncated) : manager.notificationTail(c.payload, NOTIFY_LINES, budget);
+					return { job: c.payload, tail, event: record?.event };
+				});
 				const { parts, partOf } = formatBatch(items);
 				pi.sendMessage(
 					{
@@ -187,13 +210,24 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 						content: parts.map(text => ({ type: "text" as const, text })),
 						display: true,
 						// `part`: the content part holding this completion (used by dedupeCompletions).
-						details: { deliveryId, completions: completions.map((c, i) => ({ completionId: c.completionId, part: partOf[i], job: brief(c.payload) })) },
+						details: { deliveryId, completions: completions.map((c, i) => ({ completionId: c.completionId, part: partOf[i], job: brief(c.payload),
+							...(c.subscription ? { event: c.subscription.record.event, sequence: c.subscription.record.sequence,
+								capture: { bytes: c.subscription.record.capture?.bytes ?? 0, truncated: c.subscription.record.capture?.truncated ?? false } } : {}) })) },
 					},
 					// pi decides: streaming → its follow-up queue; otherwise → start a run.
 					{ triggerTurn: true, deliverAs: "followUp" },
 				);
 			},
+			subscriptionError: (record, diagnostic) => {
+				pi.sendMessage({ customType: "pi-jobs-subscription-error", content: diagnostic, display: true,
+					details: { job: manager.get(record.payload.id) ?? record.payload } }, { triggerTurn: false });
+			},
 			lost: items => {
+				if (!shuttingDown && items.some(item => item.subscription)) {
+					const warning = "pi-jobs: subscription delivery host is gone; checks stopped and unreceipted records retained for explicit reconciliation.";
+					manager.stopSubscriptions?.(warning);
+					try { pi.sendMessage({ customType: "pi-jobs-subscription-error", content: warning, display: true }, { triggerTurn: false }); } catch {}
+				}
 				try {
 					ctxRef?.ui?.notify?.(`pi-jobs: session context is gone; completion of ${items.map(i => i.payload.id).join(", ")} was not delivered (see /jobs).`, "warning");
 				} catch {}
@@ -203,6 +237,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 
 		let manager: JobManager = new JobManager({
 			logRoot,
+			env,
 			maxRunning: options.maxRunning,
 			maxRunningWatches: options.maxRunningWatches,
 			killGraceMs: options.killGraceMs,
@@ -214,6 +249,20 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 				else live.delete(manager);
 			},
 			onTerminal: job => delivery.add({ completionId: randomUUID(), payload: job } satisfies Completion<JobSnapshot>),
+			onSubscription: (record, reservation) => {
+				reservation.onDiscard = () => delivery.pruneSubscriptions();
+				delivery.add({ completionId: record.completionId, payload: record.payload,
+					subscription: { record, retained: () => reservation.records.includes(record),
+						eligible: () => {
+							const status = laneStatus(reservation.identity);
+							if (status.state === "invalid") reservation.diagnoseOnce(() => {
+								manager.stopSubscription(record.payload.id, status.diagnostic!);
+								delivery.reportSubscriptionError(record, status.diagnostic!);
+							});
+							return status.state === "eligible";
+						},
+						sent: () => reservation.markSent(record.completionId), confirm: () => { reservation.confirm(record.completionId); } } });
+			},
 		});
 		options.onManager?.(manager);
 		const token = {};
@@ -286,6 +335,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 					catch (error) { return /stale.*(?:session|runtime)/i.test(String(error)) ? false : undefined; }
 				} };
 				owners.set(sessionId, owner);
+				manager.bindSession?.(sessionId);
 				manager.advanceSequence(highestJobId(ctx.sessionManager.getEntries()));
 			}
 			for (const notice of await stopOrphans(owners)) ctxRef?.ui?.notify?.(notice, "warning");
@@ -310,9 +360,11 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 				return;
 			}
 			if (sessionId && sessionOwners().get(sessionId)?.token === token) sessionOwners().delete(sessionId);
+			shuttingDown = true;
 			delivery.dispose();
 			try {
 				await manager.shutdown();
+				manager.reconcileSubscriptions?.();
 			} finally {
 				// Only now leave the exit-hook set; SIGKILL anything still alive first.
 				manager.killAllSync();
@@ -379,6 +431,31 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			},
 		} as any);
 
+		if (subscriptions) pi.registerTool({
+			name: "job_subscribe",
+			label: "Subscribe to inbox in background",
+			description: "Opt-in best-effort inbox subscription: successive immutable matches under one id, paused until each message receipt; no model re-arm. " +
+				"First explicitly stop old inbox-watch job_watch consumers. Declare the real marker lane/directory; trusted checks must honor them. " +
+				"Exit 0 matches, 1 is quiet, other exits/errors/truncation stop. Parked or invalid lane status blocks checks and delivery. " +
+				"End your turn after starting; do not poll or re-arm. Finite lifetime, same-process reload only; not crash-safe no-loss.",
+			parameters: subscribeParams(minInterval) as any,
+			async execute(_id: string, params: any, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
+				remember(ctx);
+				if (manager.subscriptionProtocol !== 1 || delivery.subscriptionProtocol !== 1 || typeof manager.subscribe !== "function" || typeof delivery.pruneSubscriptions !== "function")
+					throw new Error("Reload owner lacks subscription capability; stop/reconcile it before opting in.");
+				if (!sessionId) throw new Error("Subscription requires a full session identity from session_start.");
+				const timeoutSeconds = seconds(params.timeoutSeconds, "timeoutSeconds", 1, MAX_TIMEOUT_SECONDS);
+				const job = manager.subscribe({
+					sessionId, check: text(params.check, "check"), lane: text(params.lane, "lane"), inboxDir: text(params.inboxDir, "inboxDir"),
+					intervalSeconds: seconds(params.intervalSeconds, "intervalSeconds", minInterval, MAX_INTERVAL_SECONDS), timeoutSeconds,
+					checkTimeoutSeconds: params.checkTimeoutSeconds == null ? Math.min(DEFAULT_CHECK_TIMEOUT_SECONDS, timeoutSeconds) : seconds(params.checkTimeoutSeconds, "checkTimeoutSeconds", 1, MAX_TIMEOUT_SECONDS),
+					cwd: resolveCwd(params.cwd, ctx.cwd), label: typeof params.label === "string" ? params.label : undefined,
+				});
+				return result(`Started subscription ${job.id} (${jobTitle(job)}) for ${job.lane} in ${job.inboxDir}, every ${job.intervalSeconds}s, deadline ${new Date(job.deadline!).toISOString()}.\n` +
+					`log: ${job.logPath}\nEnd your turn now; matches wake you automatically. Do not poll or model-rearm.`, brief(job));
+			},
+		} as any);
+
 		pi.registerTool({
 			name: "job_list",
 			label: "List background jobs",
@@ -397,7 +474,8 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			parameters: outputParams as any,
 			async execute(_id: string, params: any) {
 				const id = text(params.id, "id");
-				const lines = params.tailLines == null ? OUTPUT_DEFAULT_LINES : Math.floor(seconds(params.tailLines, "tailLines", 1, OUTPUT_MAX_LINES, "lines"));
+				const lines = params.tailLines == null ? OUTPUT_DEFAULT_LINES : seconds(params.tailLines, "tailLines", 1, OUTPUT_MAX_LINES, "lines");
+				if (!Number.isInteger(lines)) throw new Error("tailLines must be an integer.");
 				const job = manager.get(id);
 				const tail = manager.output(id, lines, OUTPUT_BYTES);
 				const head = `${formatJobLine(job!)}\nlog: ${job!.logPath}`;

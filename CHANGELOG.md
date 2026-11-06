@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0
+
+### Added
+- Opt-in inbox subscriptions retain matched results until receipt and pause consuming checks when retained-message limits are reached.
+- Declared inbox subscriptions prevent duplicate consumers within one process and respect parked lanes.
+
+### Fixed
+- Preserve captured subscription results across owner shutdown and reload handoff.
+
 ## 0.3.1
 
 ### Fixed

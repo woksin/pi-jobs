@@ -94,6 +94,114 @@ specific commit SHA. A PR number is a moving target: a push while you wait moves
 commit, and the result you are woken with may not describe the code you meant. The tool
 descriptions tell the model the same.
 
+## Optional inbox subscriptions
+
+Off by default. Set `PI_JOBS_SUBSCRIPTIONS=1` **before loading the extension** to register
+`job_subscribe` as a sixth tool. Otherwise the original five tools and behavior are unchanged.
+This source feature does not install or activate companion automation.
+
+**Migration prerequisite:** explicitly stop all old inbox-consuming `job_watch` jobs before
+subscribing the same inbox/lane. The registry cannot detect old shell consumers. Disable model
+re-arm wrappers for subscribed lanes; do not run both paths.
+
+```ts
+job_subscribe({
+  check: './check-inbox --lane L1', // replace with your trusted consuming inbox checker
+  lane: "L1",
+  inboxDir: "/absolute/inbox",
+  intervalSeconds: 10,
+  timeoutSeconds: 3600,
+  checkTimeoutSeconds: 30,
+  label: "inbox"
+})
+```
+
+The trusted check **must honor the declared directory and lane**. The extension freezes the
+launch environment and sets `INBOX_DIR` to the canonical directory; it does not sandbox shell
+commands or infer consumer identity from them. The marker lane token must match
+`^[A-Z][A-Z0-9-]{0,15}$` and agree with known `PI_LANE_ID`/`PI_ORCH_ID`. The directory must
+exist; relative paths resolve against `cwd`, and symlink/lexical aliases reserve the same
+real path. Every session in the process shares one reservation per **canonical directory +
+lane**, regardless of command, label or interval. `cwd` and `label` are optional as for watches;
+interval/timeout bounds and per-check timeout default are the same as `job_watch`.
+
+A subscription stays `running` after each match, using one job id for successive checks.
+Exit **0** captures a match, **1** is quiet, and any other exit, signal, spawn error or per-check
+timeout stops with a terminal error. Output is captured immutably, never reread from mutable
+logs or replaced by a later check. Capture truncation or log/enqueue failure stops production
+and retains available captured bytes for reconciliation. End your turn after starting;
+neither polling nor model re-arm is needed.
+
+### Backpressure, lane status and limits
+
+- The next consuming check waits for the exact completion message's native `message_end`
+  receipt, then the configured interval. Sending/queueing is **not** receipt; neither is
+  model/user acknowledgement. At most one consuming check runs per subscription.
+- Checks and **every** send/recovery route consult the frozen status path:
+  `$LANE_STATUS_DIR/<lane>.status`, or `<canonical inbox>/status/<lane>.status`. Missing is
+  eligible. Valid `working`, `waiting-on`, `barred-by` and `closed` markers are eligible.
+  `parked` pauses checks and delivery; its assessment timestamp never auto-resumes it.
+  Update/clear the marker explicitly. Malformed, oversized, unreadable or non-regular files
+  fail closed, stop production and report one non-waking diagnostic. Retained records can
+  be delivered after status becomes eligible at a later native idle/agent boundary.
+- The finite deadline never resets after matches, parking or reload. Expiry may retain both
+  a match and terminal notice; parked expiry cannot silently discard either.
+- Subscriptions share the existing per-session watcher quota (default 32), not command slots.
+  A separate hard process limit reserves **64 owners**, including terminal/unreceipted owners.
+  Each reserves at most **one match + one terminal record**, each capturing at most **64 KiB**:
+  **128 records / 8 MiB capture data** maximum. Recovery/reload reuse these records, not copies.
+  Identity/settings/error metadata is independently bounded, including a 64 KiB launch-env
+  limit. Capacity is rejected before consuming; no overflow queue exists. Expiry, finished
+  pruning and replacement churn cannot free capacity still owned by a producer or record.
+- Subscription-only idle notifications use a fixed **250 ms** window from the first eligible
+  idle record; arrivals never slide it. Ordinary command/watch completions stay immediate and
+  may carry eligible matches. Active-turn batching uses normal `agent_end`, with no added
+  delay. Parked records do not block ordinary completions. Display output shares the existing
+  16 KiB batch tail budget.
+
+`job_list`/`job_output` expose frozen identity, settings, deadline and sequence. Retained terminal
+owners stay discoverable beyond normal finished-list pruning, including after stale-owner
+cleanup in the same process. `job_kill` first stops producers and silently discards unsent
+records. It cannot retract sent records: those stay charged until receipt or explicit
+non-reload session shutdown reconciliation. Same-process compatible `/reload` preserves
+captures, identity, deadline and receipt/recovery state, without using the old API. An adopted
+pre-feature owner still supports ordinary tools, but `job_subscribe` fails with a capability
+diagnostic until that owner is explicitly stopped/reconciled.
+
+This is **best effort**, not crash-safe no-loss or exactly-once delivery. Escape has the existing
+one-resend budget. A permanent stale host stops production and retains unreceipted records.
+Process restart loses in-memory state; durable producer spool/ACK is needed for a no-loss claim.
+
+### Structured subscription data
+
+Tool `details` is a job snapshot (`job_list` uses `{jobs: [...]}`). Additive subscription fields:
+
+```ts
+{
+  id, kind: "subscription", status, command, label?, cwd, logPath, startedAt, endedAt?,
+  timeoutSeconds, intervalSeconds, checkTimeoutSeconds,
+  lane, inboxDir, statusPath, deadline, matchSequence, checks, lastCheck?,
+  exitCode?, signal?, killedBy?, error?, logTruncated?, logError?
+}
+```
+
+Times are epoch milliseconds; `deadline` is original, and `matchSequence` starts at zero.
+`lastCheck.output` is empty for subscriptions: full capture data is owned only by its immutable
+record. Each `pi-jobs` custom message retains the existing indexed shape:
+
+```ts
+{ deliveryId, completions: [{
+  completionId, part, job,
+  event: "match" | "terminal", sequence, capture: { bytes, truncated }
+}] }
+```
+
+Every event has its own UUID. A match snapshot's `status` remains `running`; a terminal event
+has the final status. `part` locates the formatted content block for deduplication. Capture
+bytes are formatted from the reserved record, not duplicated in structured details.
+`pi-jobs-subscription-error` diagnostics have `details: {job}` and `triggerTurn: false`; they
+are not completion receipts or instructions to model-rearm.
+
 ## Completion message and delivery
 
 **Contents.** Status, title (label or command), exit status, duration and log path, plus any
@@ -119,7 +227,8 @@ jobs finished:`). The output of all completions in a message shares a 16 KB budg
 
 ### How it works
 
-`src/delivery.ts` is event-driven only: no timers, no polling, no time-based resend. Every
+For ordinary command/watch completions, `src/delivery.ts` is event-driven only: no timers,
+no polling, no time-based resend. Opt-in subscriptions add only the idle window above. Every
 message goes through `pi.sendMessage(…, { triggerTurn: true, deliverAs: "followUp" })`, and
 pi does the scheduling.
 

@@ -1,5 +1,5 @@
 /**
- * Completion delivery through pi's native paths only (no timers, no polling).
+ * Completion delivery through pi's native paths; only opt-in subscriptions use an idle timer.
  *
  * pi has no atomic "wake the agent" or reservation API, so an extension cannot make delivery
  * exactly-once. What this module does guarantee:
@@ -28,6 +28,8 @@
  *    delivery is disposed and nothing is retried.
  */
 
+import { IDLE_WINDOW_MS, type SubscriptionRecord } from "./subscription.ts";
+
 /** Custom message type of completion messages. */
 export const CUSTOM_TYPE = "pi-jobs";
 
@@ -35,6 +37,14 @@ export interface Completion<T> {
 	/** Globally unique (UUID); the only key used for deduplication. */
 	completionId: string;
 	payload: T;
+	/** Opt-in policy; ordinary completions retain their timer-free behavior. */
+	subscription?: {
+		record: SubscriptionRecord;
+		retained(): boolean;
+		eligible(): boolean;
+		sent(): void;
+		confirm(): void;
+	};
 }
 
 export interface DeliveryHost<T> {
@@ -46,9 +56,11 @@ export interface DeliveryHost<T> {
 	send(deliveryId: string, items: Completion<T>[]): void;
 	/** Called once when delivery stops for good (stale context) with what was not sent. */
 	lost?(items: Completion<T>[]): void;
+	subscriptionError?(record: SubscriptionRecord, diagnostic: string): void;
 }
 
 export class Delivery<T> {
+	readonly subscriptionProtocol = 1;
 	private host: DeliveryHost<T>;
 	private suspended = false;
 	private binding = 0;
@@ -63,6 +75,9 @@ export class Delivery<T> {
 	private readonly queued = new Map<string, Completion<T>[]>();
 	private runActive = false;
 	private disposed = false;
+	private readonly receipts = new Map<string, Completion<T>[]>();
+	private windowAt?: number;
+	private windowTimer?: NodeJS.Timeout;
 
 	constructor(host: DeliveryHost<T>, newId: () => string = () => crypto.randomUUID()) {
 		this.host = host;
@@ -84,7 +99,10 @@ export class Delivery<T> {
 	}
 
 	onAgentStart(): void {
-		if (!this.disposed && !this.suspended) this.runActive = true;
+		if (!this.disposed && !this.suspended) {
+			this.clearWindowTimer();
+			this.runActive = true;
+		}
 	}
 
 	onAgentEnd(): void {
@@ -95,8 +113,15 @@ export class Delivery<T> {
 		} catch {}
 		// An aborted run will not consume follow-ups; keep them for agent_settled.
 		if (aborted) return;
-		for (const batch of this.recovery.splice(0)) this.send(batch, "untracked");
-		if (this.held.length) this.send(this.held.splice(0), "followUp");
+		this.clearWindowTimer();
+		for (const batch of this.recovery) {
+			const eligible = this.takeEligible(batch);
+			if (eligible.length) this.send(eligible, "untracked");
+		}
+		this.recovery = this.recovery.filter(batch => batch.length);
+		const eligible = this.takeEligible(this.held);
+		if (eligible.length) this.send(eligible, "followUp");
+		this.resetWindowIfEmpty();
 	}
 
 	/**
@@ -125,12 +150,44 @@ export class Delivery<T> {
 	/** message_end of one of our messages. */
 	confirm(deliveryId: string): void {
 		this.queued.delete(deliveryId);
+		const received = this.receipts.get(deliveryId);
+		if (!received) return;
+		const ids = new Set(received.map(item => item.completionId));
+		for (const item of received) item.subscription?.confirm();
+		for (const [id, items] of this.receipts) {
+			const remaining = items.filter(item => !ids.has(item.completionId));
+			if (remaining.length) this.receipts.set(id, remaining);
+			else this.receipts.delete(id);
+		}
+		// A receipt of the original also removes a not-yet-sent recovery reference.
+		for (const batch of this.recovery) this.removeConfirmed(batch);
+		this.recovery = this.recovery.filter(batch => batch.length);
+	}
+
+	/** Always use the current binding, never an API captured by the original producer. */
+	reportSubscriptionError(record: SubscriptionRecord, diagnostic: string): void {
+		if (!this.suspended && !this.disposed) this.host.subscriptionError?.(record, diagnostic);
+	}
+
+	/** Remove explicitly reconciled records before their reserved capacity is released. */
+	pruneSubscriptions(): void {
+		this.removeConfirmed(this.held);
+		for (const batch of this.recovery) this.removeConfirmed(batch);
+		this.recovery = this.recovery.filter(batch => batch.length);
+		for (const map of [this.receipts, this.queued]) {
+			for (const [id, items] of map) {
+				this.removeConfirmed(items);
+				if (!items.length) map.delete(id);
+			}
+		}
+		this.resetWindowIfEmpty();
 	}
 
 	/** Reload keeps completions, but must never call the stale extension API. */
 	suspend(): void {
 		this.binding++;
 		this.suspended = true;
+		this.clearWindowTimer();
 		this.runActive = false;
 		for (const items of this.queued.values()) this.recovery.push(items);
 		this.queued.clear();
@@ -152,7 +209,9 @@ export class Delivery<T> {
 	dispose(): void {
 		if (this.disposed) return;
 		this.disposed = true;
-		const lost = [...this.held, ...this.recovery.flat(), ...[...this.queued.values()].flat()];
+		this.clearWindowTimer();
+		const lost = [...new Set([...this.held, ...this.recovery.flat(), ...[...this.queued.values()].flat(), ...[...this.receipts.values()].flat()])];
+		this.receipts.clear();
 		this.held = [];
 		this.recovery = [];
 		this.queued.clear();
@@ -178,9 +237,62 @@ export class Delivery<T> {
 	 */
 	private drainIfIdle(): void {
 		while (!this.disposed && !this.suspended && !this.runActive && this.pending && this.idle()) {
-			const recovered = this.recovery.shift();
-			this.send(recovered ?? this.held.splice(0), "idle");
+			const urgent = [...this.held, ...this.recovery.flat()].some(item => !item.subscription);
+			const eligibleSubscription = [...this.held, ...this.recovery.flat()].some(item => item.subscription?.retained() && item.subscription.eligible());
+			if (eligibleSubscription && this.windowAt === undefined) this.windowAt = Date.now() + IDLE_WINDOW_MS;
+			const allowSubscription = urgent || (this.windowAt !== undefined && Date.now() >= this.windowAt);
+			let items: Completion<T>[] = [];
+			for (const batch of this.recovery) {
+				items = this.takeEligible(batch, allowSubscription);
+				if (items.length) break;
+			}
+			this.recovery = this.recovery.filter(batch => batch.length);
+			if (!items.length) items = this.takeEligible(this.held, allowSubscription);
+			if (!items.length) {
+				if (eligibleSubscription && !allowSubscription) this.armWindow();
+				break;
+			}
+			this.send(items, "idle");
+			this.resetWindowIfEmpty();
 		}
+	}
+
+	private removeConfirmed(items: Completion<T>[]): void {
+		for (let i = items.length - 1; i >= 0; i--) {
+			if (items[i].subscription && !items[i].subscription!.retained()) items.splice(i, 1);
+		}
+	}
+
+	/** Leave parked records in place, without head-of-line-blocking ordinary completions. */
+	private takeEligible(items: Completion<T>[], allowSubscription = true): Completion<T>[] {
+		this.removeConfirmed(items);
+		const selected: Completion<T>[] = [];
+		for (let i = 0; i < items.length;) {
+			const policy = items[i].subscription;
+			if (!policy || (allowSubscription && policy.eligible())) selected.push(...items.splice(i, 1));
+			else i++;
+		}
+		return selected;
+	}
+
+	private clearWindowTimer(): void {
+		clearTimeout(this.windowTimer);
+		this.windowTimer = undefined;
+	}
+
+	private armWindow(): void {
+		if (this.windowTimer || this.windowAt === undefined) return;
+		this.windowTimer = setTimeout(() => {
+			this.windowTimer = undefined;
+			this.drainIfIdle();
+		}, Math.max(0, this.windowAt - Date.now()));
+		this.windowTimer.unref();
+	}
+
+	private resetWindowIfEmpty(): void {
+		if (this.pending) return;
+		this.windowAt = undefined;
+		this.clearWindowTimer();
 	}
 
 	/**
@@ -189,7 +301,17 @@ export class Delivery<T> {
 	 * when called from agent_settled).
 	 */
 	private send(items: Completion<T>[], mode: "idle" | "followUp" | "untracked"): void {
+		// Gate again at the actual send boundary, including recovery and rebind routes.
+		const eligible = this.takeEligible(items);
+		if (items.length) this.held.push(...items);
+		items = eligible;
+		if (!items.length) return;
 		const deliveryId = this.newId();
+		const subscriptions = items.filter(item => item.subscription);
+		if (subscriptions.length) {
+			this.receipts.set(deliveryId, subscriptions);
+			for (const item of subscriptions) item.subscription!.sent();
+		}
 		try {
 			this.host.send(deliveryId, items);
 		} catch {
@@ -197,7 +319,10 @@ export class Delivery<T> {
 			this.dispose(); // pi refused synchronously: the context is stale
 			return;
 		}
-		if (mode === "followUp") this.queued.set(deliveryId, items);
+		if (mode === "followUp") {
+			this.removeConfirmed(items);
+			if (items.length) this.queued.set(deliveryId, items);
+		}
 		// An idle send starts a run synchronously; hold what arrives until its agent_end.
 		else if (mode === "idle" && !this.runActive && !this.idle()) this.runActive = true;
 	}

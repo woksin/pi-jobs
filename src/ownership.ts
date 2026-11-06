@@ -1,6 +1,7 @@
 /** Process-wide ownership survives module replacement, but never a Pi process restart. */
 import { CUSTOM_TYPE, type Delivery } from "./delivery.ts";
 import type { JobManager, JobSnapshot } from "./jobs.ts";
+import { RECORD_BYTES, SUBSCRIPTION_OWNERS, type SubscriptionIdentity, type SubscriptionRecord } from "./subscription.ts";
 
 export interface Owner {
 	version: 2;
@@ -31,7 +32,7 @@ async function stopOwner(owner: any): Promise<void> {
 		if (typeof owner.delivery?.dispose === "function") owner.delivery.dispose();
 	} finally {
 		try {
-			if (typeof owner.manager?.shutdown === "function") await owner.manager.shutdown();
+			if (typeof owner.manager?.shutdown === "function") await owner.manager.shutdown(undefined, "Subscription owner retired without adoption; retained for explicit reconciliation.");
 		} finally {
 			if (typeof owner.manager?.killAllSync === "function") owner.manager.killAllSync();
 		}
@@ -73,7 +74,7 @@ export async function stopOrphans(owners = sessionOwners()): Promise<string[]> {
 		const jobs = owner.manager.list().filter(job => job.status === "running");
 		owners.delete(sessionId);
 		owner.delivery.dispose();
-		await owner.manager.shutdown();
+		await owner.manager.shutdown(undefined, "Subscription owner is stale; retained for explicit reconciliation.");
 		if (jobs.length) notices.push(`pi-jobs: owner session ${sessionId} is gone; stopped orphaned ${jobs.map(job => `${job.kind} ${job.id} (log: ${job.logPath})`).join(", ")}.`);
 	}
 	return notices;
@@ -87,7 +88,7 @@ export function historicalRunningJobs(entries: readonly any[]): JobSnapshot[] {
 	};
 	for (const entry of entries) {
 		const message = entry?.type === "message" ? entry.message : entry?.type === "custom_message" ? { ...entry, role: "custom" } : undefined;
-		if (message?.role === "toolResult" && ["job_start", "job_watch", "job_list", "job_output", "job_kill"].includes(message.toolName)) {
+		if (message?.role === "toolResult" && ["job_start", "job_watch", "job_subscribe", "job_list", "job_output", "job_kill"].includes(message.toolName)) {
 			record(message.details);
 			for (const job of message.details?.jobs ?? []) record(job);
 		}
@@ -107,12 +108,12 @@ export function highestJobId(entries: readonly any[]): number {
 	};
 	for (const entry of entries) {
 		const m = entry?.type === "message" ? entry.message : entry?.type === "custom_message" ? { ...entry, role: "custom" } : undefined;
-		if (m?.role === "toolResult" && ["job_start", "job_watch", "job_list", "job_output", "job_kill"].includes(m.toolName)) {
+		if (m?.role === "toolResult" && ["job_start", "job_watch", "job_subscribe", "job_list", "job_output", "job_kill"].includes(m.toolName)) {
 			consider(m.details?.id);
 			for (const job of m.details?.jobs ?? []) consider(job?.id);
-			if (m.toolName === "job_start" || m.toolName === "job_watch") {
+			if (["job_start", "job_watch", "job_subscribe"].includes(m.toolName)) {
 				const text = typeof m.content === "string" ? m.content : (m.content ?? []).map((p: any) => p.text ?? "").join("\n");
-				consider(/^Started (?:job|watch) (j\d+)\b/.exec(text)?.[1]);
+				consider(/^Started (?:job|watch|subscription) (j\d+)\b/.exec(text)?.[1]);
 			}
 		}
 		if (m?.role === "custom" && m.customType === CUSTOM_TYPE) {
@@ -120,4 +121,140 @@ export function highestJobId(entries: readonly any[]): number {
 		}
 	}
 	return highest;
+}
+
+const RESERVATIONS = Symbol.for("pi-jobs.subscriptionReservations.v1");
+
+/** Unlike finished-job history, this map owns all active AND retained terminal slots. */
+export function subscriptionReservations(): Map<string, SubscriptionReservation> {
+	const global = globalThis as unknown as Record<symbol, Map<string, SubscriptionReservation>>;
+	return global[RESERVATIONS] ??= new Map();
+}
+
+export class SubscriptionReservation {
+	readonly identity: SubscriptionIdentity;
+	readonly sessionId: string;
+	readonly key: string;
+	/** Latest bounded snapshot remains discoverable even after ordinary finished pruning. */
+	snapshot?: JobSnapshot;
+	onReceipt?: () => void;
+	onRelease?: () => void;
+	onDiscard?: () => void;
+	onKill?: () => Promise<JobSnapshot>;
+	private diagnosticReported = false;
+	private reconciled = false;
+	private active = true;
+	private publishing = false;
+	private match?: SubscriptionRecord;
+	private terminal?: SubscriptionRecord;
+	private readonly sent = new Set<string>();
+
+	constructor(identity: SubscriptionIdentity, sessionId: string, key: string) {
+		this.identity = identity;
+		this.sessionId = sessionId;
+		this.key = key;
+	}
+
+	get records(): readonly SubscriptionRecord[] {
+		return [this.match, this.terminal].filter((r): r is SubscriptionRecord => r !== undefined);
+	}
+
+	diagnoseOnce(report: () => void): void {
+		if (this.diagnosticReported) return;
+		this.diagnosticReported = true;
+		try { report(); } catch { /* A diagnostic must not reopen a consuming path. */ }
+	}
+
+	beginCheck(): boolean {
+		if (!this.active || this.publishing || this.match) return false;
+		this.publishing = true;
+		return true;
+	}
+
+	endCheck(): void {
+		this.publishing = false;
+		this.releaseIfSettled();
+	}
+
+	retain(record: SubscriptionRecord): boolean {
+		if (this.reconciled) return false;
+		if (record.capture && (record.capture.bytes > RECORD_BYTES || record.capture.data.length > RECORD_BYTES)) {
+			throw new Error("Subscription capture exceeds its reserved 64 KiB slot.");
+		}
+		const slot = record.event === "match" ? "match" : "terminal";
+		if (this[slot]) throw new Error(`Subscription ${slot} slot is awaiting receipt.`);
+		this[slot] = record;
+		return true;
+	}
+
+	markSent(completionId: string): void {
+		if (this.records.some(r => r.completionId === completionId)) this.sent.add(completionId);
+	}
+
+	confirm(completionId: string): boolean {
+		const match = this.match?.completionId === completionId;
+		const terminal = this.terminal?.completionId === completionId;
+		if (!match && !terminal) return false;
+		if (match) this.match = undefined;
+		if (terminal) this.terminal = undefined;
+		this.sent.delete(completionId);
+		this.releaseIfSettled();
+		if (match && this.active) this.onReceipt?.();
+		return true;
+	}
+
+	/** Stop producing, but never treat expiry/failure as a receipt. */
+	retire(terminal?: SubscriptionRecord): void {
+		if (terminal && !this.reconciled) this.retain(terminal);
+		this.active = false;
+		this.onReceipt = undefined;
+		this.releaseIfSettled();
+	}
+
+	/** Explicit kill abandons only records that Pi has not already queued. */
+	abandonUnsent(): void {
+		this.active = false;
+		this.onReceipt = undefined;
+		if (this.match && !this.sent.has(this.match.completionId)) this.match = undefined;
+		if (this.terminal && !this.sent.has(this.terminal.completionId)) this.terminal = undefined;
+		this.onDiscard?.();
+		this.releaseIfSettled();
+	}
+
+	/** Explicit shutdown reconciliation only, never pruning/expiry/stale-owner cleanup. */
+	reconcile(): void {
+		this.reconciled = true;
+		this.active = false;
+		this.onReceipt = undefined;
+		this.match = undefined;
+		this.terminal = undefined;
+		this.sent.clear();
+		this.onDiscard?.();
+		this.releaseIfSettled();
+	}
+
+	private releaseIfSettled(): void {
+		if (this.active || this.publishing || this.match || this.terminal) return;
+		const registry = subscriptionReservations();
+		if (registry.get(this.key) === this) {
+			registry.delete(this.key);
+			const release = this.onRelease;
+			this.onRelease = undefined;
+			this.onDiscard = undefined;
+			this.onKill = undefined;
+			release?.();
+		}
+	}
+}
+
+/** Canonical inbox + marker lane is the only consumer key: session/check/aliases cannot evade it. */
+export function reserveSubscription(identity: SubscriptionIdentity, sessionId: string): SubscriptionReservation {
+	const registry = subscriptionReservations();
+	const key = JSON.stringify([identity.inboxDir, identity.lane]);
+	if (registry.has(key)) throw new Error(`Inbox subscription for ${identity.lane} in ${identity.inboxDir} is already reserved; stop/reconcile its owner first.`);
+	if (registry.size >= SUBSCRIPTION_OWNERS) throw new Error("Subscription capacity exhausted (64 owners / 128 reserved slots); receipt or explicit reconciliation is required.");
+	if (sessionId.length > 1024 || identity.inboxDir.length > 4096 || identity.statusPath.length > 8192) throw new Error("Subscription identity exceeds metadata limits.");
+	const reservation = new SubscriptionReservation(identity, sessionId, key);
+	registry.set(key, reservation);
+	return reservation;
 }

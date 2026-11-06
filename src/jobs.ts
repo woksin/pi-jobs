@@ -6,7 +6,7 @@
  * Every job reaches exactly one terminal state (see `settle`). `onTerminal` fires once for
  * it, except for jobs stopped by `kill()` or `shutdown()`, whose caller already knows.
  */
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_LOG_CAP_BYTES, LogWriter } from "./logwriter.ts";
@@ -14,7 +14,10 @@ import { SupervisedRun, type RunOutcome } from "./supervisor.ts";
 import { readTail, tailBuffer, TailSink, type Tail } from "./tail.ts";
 import { evaluateWatch, type CheckResult, type WatchUntil } from "./watch.ts";
 
-export type JobKind = "command" | "watch";
+import { reserveSubscription, subscriptionReservations, type SubscriptionReservation } from "./ownership.ts";
+import { captureOutput, classifyInboxExit, declaredIdentity, laneStatus, RECORD_BYTES, type ImmutableCapture, type SubscriptionRecord } from "./subscription.ts";
+
+export type JobKind = "command" | "watch" | "subscription";
 export type JobStatus = "running" | "succeeded" | "failed" | "timed_out" | "killed" | "matched";
 
 export interface JobSnapshot {
@@ -43,6 +46,12 @@ export interface JobSnapshot {
 	logTruncated?: boolean;
 	/** First log write error (output after it was not logged). */
 	logError?: string;
+	lane?: string;
+	inboxDir?: string;
+	statusPath?: string;
+	deadline?: number;
+	matchSequence?: number;
+	checkTimeoutSeconds?: number;
 	/** Why the job could not run (e.g. spawn failure). */
 	error?: string;
 }
@@ -64,7 +73,14 @@ export interface WatchOptions {
 	label?: string;
 }
 
+export interface SubscriptionOptions extends Omit<WatchOptions, "until"> {
+	sessionId: string;
+	lane: string;
+	inboxDir: string;
+}
+
 export interface ManagerOptions {
+	onSubscription?: (record: SubscriptionRecord, reservation: SubscriptionReservation) => void;
 	logRoot: string;
 	onTerminal: (job: JobSnapshot) => void;
 	/**
@@ -102,6 +118,7 @@ export interface ManagerOptions {
 }
 
 export interface ResolvedManagerOptions {
+	onSubscription: (record: SubscriptionRecord, reservation: SubscriptionReservation) => void;
 	logRoot: string;
 	onTerminal: (job: JobSnapshot) => void;
 	onActiveChange: (active: boolean) => void;
@@ -135,6 +152,7 @@ export const DEFAULT_DRAIN_MS = 1000;
 export function resolveManagerOptions(options: ManagerOptions): ResolvedManagerOptions {
 	const env = options.env ?? process.env;
 	return {
+		onSubscription: options.onSubscription ?? (() => {}),
 		logRoot: options.logRoot,
 		onTerminal: options.onTerminal,
 		onActiveChange: options.onActiveChange ?? (() => {}),
@@ -149,7 +167,7 @@ export function resolveManagerOptions(options: ManagerOptions): ResolvedManagerO
 	};
 }
 
-type Pending = "timeout" | "kill";
+type Pending = "timeout" | "kill" | "failure";
 
 interface Job {
 	snap: JobSnapshot;
@@ -162,6 +180,7 @@ interface Job {
 	done: Promise<void>;
 	resolveDone: () => void;
 	baseline?: string;
+	subscription?: { reservation: SubscriptionReservation; options: SubscriptionOptions; env: NodeJS.ProcessEnv; captureCheck?: () => ImmutableCapture };
 }
 
 /**
@@ -181,10 +200,13 @@ function pad(n: number): string {
 }
 
 export class JobManager {
+	readonly subscriptionProtocol = 1;
 	readonly opts: ResolvedManagerOptions;
 	private readonly tag = randomBytes(3).toString("hex");
 	private readonly running = new Map<string, Job>();
 	private finished: Job[] = [];
+	private readonly subscriptions = new Map<string, SubscriptionReservation>();
+	private sessionId?: string;
 	/** Supervisors not yet reaped: the processes this manager owns. */
 	private readonly runs = new Set<SupervisedRun>();
 	private seq = 0;
@@ -202,6 +224,19 @@ export class JobManager {
 
 	get runningCount(): number {
 		return this.running.size;
+	}
+
+	/** Recover discoverability (not production) of retained records from retired managers. */
+	bindSession(sessionId: string): void {
+		this.sessionId = sessionId;
+		for (const reservation of this.retainedSubscriptions()) {
+			const id = reservation.snapshot?.id;
+			if (id && /^j\d+$/.test(id)) this.advanceSequence(Number(id.slice(1)));
+		}
+	}
+
+	private retainedSubscriptions(): SubscriptionReservation[] {
+		return [...subscriptionReservations().values()].filter(r => this.sessionId ? r.sessionId === this.sessionId : this.subscriptions.has(r.snapshot?.id ?? "") && this.subscriptions.get(r.snapshot!.id) === r);
 	}
 
 	/** True while the manager owns running jobs or supervisors that are still cleaning up. */
@@ -241,10 +276,66 @@ export class JobManager {
 		return { ...job.snap };
 	}
 
+	/** Reserve the declared consumer before opening logs or starting a consuming subprocess. */
+	subscribe(options: SubscriptionOptions): JobSnapshot {
+		if (options.check.length > 8192 || options.cwd.length > 4096 || (options.label?.length ?? 0) > 256) throw new Error("Subscription settings exceed metadata limits.");
+		options = Object.freeze({ ...options });
+		const env = { ...this.opts.env };
+		if (Object.entries(env).reduce((bytes, [key, value]) => bytes + Buffer.byteLength(key) + Buffer.byteLength(value ?? ""), 0) > 65536) throw new Error("Subscription environment exceeds its 64 KiB metadata limit.");
+		const identity = declaredIdentity({ ...options, env });
+		const reservation = reserveSubscription(identity, options.sessionId);
+		let job: Job | undefined;
+		try {
+			job = this.create("subscription", options.check, options.cwd, options.timeoutSeconds, options.label);
+			job.subscription = { reservation, options: { ...options }, env: { ...env, INBOX_DIR: identity.inboxDir } };
+			Object.assign(job.snap, identity, { intervalSeconds: options.intervalSeconds, checkTimeoutSeconds: options.checkTimeoutSeconds,
+				deadline: job.snap.startedAt + options.timeoutSeconds * 1000, checks: 0, matchSequence: 0 });
+			this.subscriptions.set(job.snap.id, reservation);
+			reservation.onRelease = () => this.subscriptions.delete(job!.snap.id);
+			reservation.onKill = () => this.kill(job!.snap.id);
+			reservation.snapshot = { ...job.snap };
+			reservation.onReceipt = () => this.addTimer(job!, options.intervalSeconds * 1000, () => this.runCheck(job!, options));
+			job.log = new LogWriter(job.snap.logPath, this.opts.logCapBytes);
+			this.addTimer(job, options.timeoutSeconds * 1000, () => this.stop(job!, "timeout"));
+			this.runCheck(job, options);
+			return { ...job.snap };
+		} catch (error) {
+			if (job) this.discard(job);
+			reservation.endCheck();
+			reservation.reconcile();
+			throw error;
+		}
+	}
+
+	/** Fence a producer without waking through a now-invalid delivery path. */
+	stopSubscription(id: string, error: string): void {
+		const job = this.running.get(id);
+		if (!job?.subscription) return;
+		job.snap.error = error.slice(0, 1024);
+		this.stop(job, "failure");
+	}
+
+	/** Fence subscription producers when their delivery host is permanently gone. */
+	stopSubscriptions(error: string): void {
+		for (const job of this.running.values()) this.stopSubscription(job.snap.id, error);
+	}
+
+	/** Explicit session shutdown, not stale-host/expiry cleanup. Call only after producers stop. */
+	reconcileSubscriptions(): void {
+		for (const reservation of this.retainedSubscriptions()) reservation.reconcile();
+	}
+
 	/** Stop a running job. No notification is sent; the returned snapshot is its final state. */
 	async kill(id: string): Promise<JobSnapshot> {
 		const job = this.running.get(id);
 		if (!job) {
+			const retained = this.retainedSubscriptions().find(r => r.snapshot?.id === id);
+			if (retained && !this.subscriptions.has(id) && retained.onKill) return retained.onKill();
+			if (retained?.snapshot) {
+				const snapshot = { ...retained.snapshot };
+				retained.abandonUnsent();
+				return snapshot;
+			}
 			const done = this.finished.find(j => j.snap.id === id);
 			if (done) return { ...done.snap };
 			throw new Error(`No job with id ${id} in this session.`);
@@ -253,6 +344,7 @@ export class JobManager {
 		job.snap.killedBy = "request";
 		this.stop(job, "kill");
 		await this.waitFor([job], this.opts.killGraceMs + this.opts.drainMs + 1000);
+		job.subscription?.reservation.abandonUnsent();
 		return { ...job.snap };
 	}
 
@@ -260,18 +352,22 @@ export class JobManager {
 	 * Stop everything, silently: SIGTERM, up to `waitMs` for jobs to end, then SIGKILL every
 	 * owned group, destroy every pipe and clear every timer. Safe to call more than once.
 	 */
-	async shutdown(waitMs = 1500): Promise<void> {
+	async shutdown(waitMs = 1500, retainedDiagnostic?: string): Promise<void> {
 		this.closed = true;
 		const jobs = [...this.running.values()];
 		for (const job of jobs) {
-			job.notify = false;
+			job.notify = !!job.subscription && retainedDiagnostic !== undefined;
 			job.snap.killedBy = "shutdown";
-			this.stop(job, "kill");
+			if (job.notify) job.snap.error = retainedDiagnostic!.slice(0, 1024);
+			this.stop(job, job.notify ? "failure" : "kill");
 		}
 		await this.waitFor(jobs, Math.min(waitMs, this.opts.killGraceMs));
 		this.killAllSync();
 		for (const job of jobs) job.run?.dispose();
-		for (const job of [...this.running.values()]) this.settle(job, "killed");
+		for (const job of [...this.running.values()]) {
+			job.notify = !!job.subscription && retainedDiagnostic !== undefined;
+			this.settle(job, job.notify ? "failed" : "killed", {}, job.subscription?.captureCheck?.());
+		}
 		for (const run of this.runs) run.dispose();
 	}
 
@@ -284,12 +380,17 @@ export class JobManager {
 
 	get(id: string): JobSnapshot | undefined {
 		const job = this.running.get(id) ?? this.finished.find(j => j.snap.id === id);
-		return job && { ...job.snap };
+		const snapshot = job?.snap ?? this.retainedSubscriptions().find(r => r.snapshot?.id === id)?.snapshot;
+		return snapshot && { ...snapshot };
 	}
 
 	/** Running jobs first (oldest first), then finished jobs (newest first). */
 	list(): JobSnapshot[] {
-		return [...this.running.values(), ...this.finished].map(j => ({ ...j.snap }));
+		const jobs = [...this.running.values(), ...this.finished].map(j => ({ ...j.snap }));
+		for (const reservation of this.retainedSubscriptions()) {
+			if (reservation.snapshot && !jobs.some(j => j.id === reservation.snapshot!.id)) jobs.push({ ...reservation.snapshot });
+		}
+		return jobs;
 	}
 
 	output(id: string, maxLines: number, maxBytes: number): Tail {
@@ -304,11 +405,11 @@ export class JobManager {
 		return readTail(job.logPath, maxLines, maxBytes);
 	}
 
-	private launch(command: string, cwd: string, onOutput: (chunk: Buffer, stream: "out" | "err") => void, onDone: (o: RunOutcome) => void): SupervisedRun {
+	private launch(command: string, cwd: string, onOutput: (chunk: Buffer, stream: "out" | "err") => void, onDone: (o: RunOutcome) => void, env = this.opts.env): SupervisedRun {
 		const run: SupervisedRun = new SupervisedRun({
 			command,
 			cwd,
-			env: this.opts.env,
+			env,
 			graceMs: this.opts.killGraceMs,
 			drainMs: this.opts.drainMs,
 			onOutput,
@@ -332,11 +433,12 @@ export class JobManager {
 
 	private create(kind: JobKind, command: string, cwd: string, timeoutSeconds: number, label?: string): Job {
 		if (this.closed) throw new Error("The session is shutting down; no new background jobs.");
-		const sameKind = [...this.running.values()].filter(j => j.snap.kind === kind).length;
-		const cap = kind === "watch" ? this.opts.maxRunningWatches : this.opts.maxRunning;
+		const watcher = kind !== "command";
+		const sameKind = [...this.running.values()].filter(j => (j.snap.kind !== "command") === watcher).length;
+		const cap = watcher ? this.opts.maxRunningWatches : this.opts.maxRunning;
 		if (sameKind >= cap)
 			throw new Error(
-				`Too many running background ${kind === "watch" ? "watches" : "jobs"} (${sameKind}/${cap}). ` +
+				`Too many running background ${watcher ? "watches" : "jobs"} (${sameKind}/${cap}). ` +
 					"Wait for a completion notification or stop one with job_kill.",
 			);
 		let isDir = false;
@@ -385,10 +487,22 @@ export class JobManager {
 		this.updateActive();
 	}
 
-	private runCheck(job: Job, options: WatchOptions): void {
+	private runCheck(job: Job, options: WatchOptions | SubscriptionOptions): void {
 		if (job.snap.status !== "running") return;
+		const subscription = job.subscription;
+		if (subscription) {
+			const status = laneStatus(subscription.reservation.identity);
+			if (status.state === "invalid") return this.settle(job, "failed", { error: status.diagnostic });
+			if (status.state === "parked") {
+				this.addTimer(job, options.intervalSeconds * 1000, () => this.runCheck(job, options));
+				return;
+			}
+			if (!subscription.reservation.beginCheck()) return;
+		}
 		const n = (job.snap.checks = (job.snap.checks ?? 0) + 1);
-		const sink = new TailSink(this.opts.checkOutputBytes);
+		const sink = new TailSink(subscription ? Math.min(this.opts.checkOutputBytes, RECORD_BYTES) : this.opts.checkOutputBytes);
+		// Forced shutdown must freeze the in-flight sink before settling, not wait for pipe callbacks.
+		if (subscription) subscription.captureCheck = () => captureOutput(sink.toBuffer(), sink.dropped);
 		// Full-stream digests for until:"change" (the sink keeps only a bounded tail). One per
 		// stream, so nondeterministic stdout/stderr interleaving cannot look like a change.
 		const outHash = createHash("sha256");
@@ -402,6 +516,8 @@ export class JobManager {
 				job.timers.delete(checkTimer);
 			}
 			if (job.run === run) job.run = undefined;
+			if (subscription) subscription.captureCheck = undefined;
+			if (job.snap.status !== "running") return;
 			if (outcome.error) sink.push(Buffer.from(`pi-jobs: failed to run check: ${outcome.error}\n`));
 			const raw = sink.toBuffer();
 			const output = tailBuffer(raw, 1000, this.opts.checkOutputBytes, !sink.dropped).text;
@@ -415,10 +531,16 @@ export class JobManager {
 			if (job.snap.status !== "running") return;
 			// A check cut short by the watch's own timeout/kill says less than the last completed
 			// one: keep reporting that.
-			if (job.pending === undefined || !job.snap.lastCheck) job.snap.lastCheck = result;
-			if (job.pending === "kill") return void this.settle(job, "killed");
-			if (job.pending === "timeout") return void this.settle(job, "timed_out");
-			const verdict = evaluateWatch(options.until, result, job.baseline);
+			if (job.pending === undefined || !job.snap.lastCheck) job.snap.lastCheck = subscription ? { ...result, output: "" } : result;
+			const stoppedCapture = subscription && job.pending ? captureOutput(raw, sink.dropped) : undefined;
+			if (job.pending === "failure") return void this.settle(job, "failed", {}, stoppedCapture);
+			if (job.pending === "kill") return void this.settle(job, "killed", {}, stoppedCapture);
+			if (job.pending === "timeout") return void this.settle(job, "timed_out", {}, stoppedCapture);
+			if (subscription) {
+				job.snap.lastCheck = { ...result, output: "" };
+				return this.subscriptionChecked(job, outcome, timedOut, captureOutput(raw, sink.dropped));
+			}
+			const verdict = evaluateWatch((options as WatchOptions).until, result, job.baseline);
 			job.baseline = verdict.baseline;
 			if (verdict.matched) return void this.settle(job, "matched", { exitCode: outcome.exitCode, signal: outcome.signal });
 			this.addTimer(job, options.intervalSeconds * 1000, () => this.runCheck(job, options));
@@ -428,14 +550,16 @@ export class JobManager {
 				options.check,
 				options.cwd,
 				(chunk, stream) => {
+					if (job.snap.status !== "running") return;
 					(stream === "err" ? errHash : outHash).update(chunk);
 					sink.push(chunk);
 				},
 				finish,
+				subscription?.env,
 			);
 		} catch (err) {
 			// The first check failing synchronously means the check can never run: let watch() reject.
-			if (n === 1) throw err;
+			if (n === 1 && !subscription) throw err;
 			return finish({ exitCode: null, signal: null, error: (err as Error).message });
 		}
 		job.run = run;
@@ -445,15 +569,44 @@ export class JobManager {
 		});
 	}
 
+	private subscriptionChecked(job: Job, outcome: RunOutcome, timedOut: boolean, capture: ImmutableCapture): void {
+		const { reservation, options } = job.subscription!;
+		const verdict = classifyInboxExit(outcome, timedOut);
+		if (verdict === "match") {
+			job.snap.matchSequence = (job.snap.matchSequence ?? 0) + 1;
+			const record = this.subscriptionRecord(job, "match", capture);
+			if (!reservation.retain(record)) return this.settle(job, "killed");
+			reservation.snapshot = { ...job.snap };
+			reservation.endCheck();
+			if (!this.publishSubscription(record, reservation)) return this.settle(job, "failed", { error: "Subscription enqueue failed; capture retained for reconciliation." });
+		}
+		if (capture.truncated || job.log?.error || verdict === "failure") {
+			const error = capture.truncated ? "Subscription capture truncated; stopped for reconciliation." : job.log?.error ?? outcome.error ?? `Subscription check failed (${timedOut ? "timeout" : outcome.signal ?? `exit ${outcome.exitCode}`}).`;
+			return this.settle(job, "failed", { error: error.slice(0, 1024), exitCode: outcome.exitCode, signal: outcome.signal }, verdict === "match" ? undefined : capture);
+		}
+		reservation.endCheck();
+		if (verdict === "quiet") this.addTimer(job, options.intervalSeconds * 1000, () => this.runCheck(job, options));
+	}
+
+	private subscriptionRecord(job: Job, event: "match" | "terminal", capture?: ImmutableCapture): SubscriptionRecord {
+		const payload = Object.freeze({ ...job.snap, ...(job.snap.lastCheck ? { lastCheck: Object.freeze({ ...job.snap.lastCheck, output: "" }) } : {}) });
+		return Object.freeze({ completionId: randomUUID(), payload, event, sequence: job.snap.matchSequence ?? 0, ...(capture ? { capture } : {}) });
+	}
+
+	private publishSubscription(record: SubscriptionRecord, reservation: SubscriptionReservation): boolean {
+		try { this.opts.onSubscription(record, reservation); return true; }
+		catch { return false; } // Caller stops; reserved slots remain available for reconciliation.
+	}
+
 	/** Begin stopping a job; it settles when its run reports. */
 	private stop(job: Job, reason: Pending): void {
 		if (job.snap.status !== "running") return;
 		job.pending ??= reason;
 		if (job.run) job.run.terminate();
-		else if (job.snap.kind === "watch") this.settle(job, job.pending === "timeout" ? "timed_out" : "killed");
+		else if (job.snap.kind !== "command") this.settle(job, job.pending === "timeout" ? "timed_out" : job.pending === "failure" ? "failed" : "killed");
 	}
 
-	private settle(job: Job, status: Exclude<JobStatus, "running">, extra: Partial<JobSnapshot> = {}): void {
+	private settle(job: Job, status: Exclude<JobStatus, "running">, extra: Partial<JobSnapshot> = {}, capture?: ImmutableCapture): void {
 		if (job.snap.status !== "running") return;
 		const log = job.log;
 		const logExtra: Partial<JobSnapshot> = {};
@@ -468,6 +621,16 @@ export class JobManager {
 		this.finished.length = Math.min(this.finished.length, this.opts.keepFinished);
 		job.resolveDone();
 		this.updateActive();
+		if (job.subscription) {
+			job.subscription.captureCheck = undefined;
+			const reservation = job.subscription.reservation;
+			reservation.snapshot = { ...job.snap, lastCheck: job.snap.lastCheck && { ...job.snap.lastCheck, output: "" } };
+			const record = job.notify ? this.subscriptionRecord(job, "terminal", capture) : undefined;
+			reservation.retire(record);
+			reservation.endCheck();
+			if (record && reservation.records.includes(record)) this.publishSubscription(record, reservation);
+			return;
+		}
 		if (!job.notify) return;
 		try {
 			this.opts.onTerminal({ ...job.snap });
