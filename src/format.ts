@@ -40,9 +40,11 @@ function durationOf(job: JobSnapshot, now: number): number {
 }
 
 /** The single completion notification that wakes the agent. */
-export function formatNotification(job: JobSnapshot, tail: Tail, now = Date.now()): string {
-	const kind = job.kind === "watch" ? "Watch" : "Job";
-	const head = [`${kind} ${job.id} ${job.status.replace("_", " ")}: ${jobTitle(job)}`];
+export function formatNotification(job: JobSnapshot, tail: Tail, now = Date.now(), event?: "match" | "terminal"): string {
+	const kind = job.kind === "subscription" ? "Subscription" : job.kind === "watch" ? "Watch" : "Job";
+	const status = event === "match" ? `match #${job.matchSequence}` : job.status.replace("_", " ");
+	const head = [`${kind} ${job.id} ${status}: ${jobTitle(job)}`];
+	if (job.kind === "subscription") head.push(`lane: ${job.lane} · inbox: ${job.inboxDir}`);
 	const facts: string[] = [];
 	if (job.kind === "watch") {
 		facts.push(`until ${job.until}`, `${job.checks ?? 0} check${job.checks === 1 ? "" : "s"}`);
@@ -58,11 +60,11 @@ export function formatNotification(job: JobSnapshot, tail: Tail, now = Date.now(
 	facts.push(`after ${formatDuration(durationOf(job, now))}`);
 	if (job.status === "timed_out") facts.push(`timeout ${job.timeoutSeconds}s`);
 	head.push(facts.join(" · "));
-	if (job.label) head.push(`${job.kind === "watch" ? "check" : "command"}: ${oneLine(job.command, 200)}`);
+	if (job.label) head.push(`${job.kind !== "command" ? "check" : "command"}: ${oneLine(job.command, 200)}`);
 	head.push(`log: ${job.logPath}${job.logTruncated ? " (truncated at the size cap)" : ""}`);
 	if (job.logError) head.push(`log write error: ${job.logError} (later output was not logged)`);
 	if (job.error) head.push(`error: ${job.error}`);
-	const which = job.kind === "watch" ? "last check output" : "output";
+	const which = job.kind === "subscription" ? "captured check output" : job.kind === "watch" ? "last check output" : "output";
 	if (tail.text === "") head.push(`(no ${which})`);
 	else head.push(`${tail.truncated ? `${which} (tail)` : which}:`, tail.text);
 	return head.join("\n");
@@ -79,15 +81,15 @@ export interface FormattedBatch {
  * One wake-up message for one or more completions. A single completion keeps the plain
  * format; several are numbered blocks, one content part each, under a header part.
  */
-export function formatBatch(items: { job: JobSnapshot; tail: Tail }[], now = Date.now()): FormattedBatch {
-	if (items.length === 1) return { parts: [formatNotification(items[0].job, items[0].tail, now)], partOf: [0] };
+export function formatBatch(items: { job: JobSnapshot; tail: Tail; event?: "match" | "terminal" }[], now = Date.now()): FormattedBatch {
+	if (items.length === 1) return { parts: [formatNotification(items[0].job, items[0].tail, now, items[0].event)], partOf: [0] };
 	const n = items.length;
-	const blocks = items.map((it, i) => `[${i + 1}/${n}] ${formatNotification(it.job, it.tail, now)}${i < n - 1 ? "\n\n" : ""}`);
-	return { parts: [`${n} background jobs finished:\n\n`, ...blocks], partOf: items.map((_, i) => i + 1) };
+	const blocks = items.map((it, i) => `[${i + 1}/${n}] ${formatNotification(it.job, it.tail, now, it.event)}${i < n - 1 ? "\n\n" : ""}`);
+	return { parts: [`${n} background ${items.some(it => it.event) ? "job events" : "jobs finished"}:\n\n`, ...blocks], partOf: items.map((_, i) => i + 1) };
 }
 
 export function formatJobLine(job: JobSnapshot, now = Date.now()): string {
-	const kind = job.kind === "watch" ? "watch" : "job";
+	const kind = job.kind === "subscription" ? "subscription" : job.kind === "watch" ? "watch" : "job";
 	const parts = [`${job.id}`, kind, job.status];
 	if (job.status !== "running") {
 		const exit = job.kind === "watch" ? "" : exitText(job.exitCode, job.signal);

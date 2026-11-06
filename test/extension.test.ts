@@ -2,7 +2,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createJobsExtension, CUSTOM_TYPE, liveManagers } from "../src/extension.ts";
 import { piAiEntry, runtimeDirectory } from "./runtime.ts";
@@ -85,6 +85,114 @@ test("registers the five tools and /jobs, with no-poll guidance", t => {
 	// CI guidance: watch an immutable target, not a PR number.
 	assert.match(tools.get("job_start").description, /gh run watch <run-id> --exit-status/);
 	assert.match(tools.get("job_start").description, /commit SHA.*not a PR number/s);
+});
+
+test("opt-in registers a sixth tool; subscription matches stay running and resume only after receipt", async t => {
+	const f = setup(t, { subscriptions: true, env: {} });
+	assert.equal(f.tools.size, 6);
+	assert.ok(f.tools.has("job_subscribe"));
+	await f.emit("session_start", { reason: "new" });
+	const res = await f.call("job_subscribe", { check: "printf immutable", lane: "L1", inboxDir: f.dir, intervalSeconds: 0.1, timeoutSeconds: 5 }, f.dir);
+	assert.equal(res.details.kind, "subscription");
+	assert.equal(res.details.lane, "L1");
+	assert.equal(res.details.inboxDir, realpathSync(f.dir));
+	assert.equal(res.details.deadline, res.details.startedAt + 5000);
+	await waitUntil(() => f.sent.length === 1);
+	const first = f.sent[0].message.details.completions[0];
+	assert.equal(first.event, "match");
+	assert.equal(first.sequence, 1);
+	assert.equal(first.job.status, "running");
+	assert.match(f.sent[0].message.content[0].text, /Subscription j1 match #1/);
+	assert.match(f.sent[0].message.content[0].text, /immutable$/);
+	await sleep(150);
+	assert.equal(f.manager()!.get("j1")?.checks, 1);
+	await f.emit("message_end", { message: { role: "custom", ...f.sent[0].message } });
+	await waitUntil(() => f.sent.length === 2);
+	assert.equal(f.sent[1].message.details.completions[0].sequence, 2);
+	assert.notEqual(f.sent[1].message.details.completions[0].completionId, first.completionId);
+	await f.call("job_kill", { id: "j1" }, f.dir);
+	await sleep(150);
+	assert.equal(f.sent.length, 2);
+});
+
+test("subscriptions reject process-wide directory aliases across session owners before consuming", async t => {
+	const f = setup(t, { subscriptions: true, env: {} });
+	const other = setup(t, { subscriptions: true, env: {} });
+	await f.emit("session_start", { reason: "new" });
+	await other.emit("session_start", { reason: "new" });
+	const params = { check: "exit 1", lane: "L1", inboxDir: f.dir, intervalSeconds: 0.1, timeoutSeconds: 5 };
+	await f.call("job_subscribe", params, f.dir);
+	await assert.rejects(other.call("job_subscribe", { ...params, check: "touch must-not-consume", label: "different", inboxDir: f.dir + "/" }, other.dir), /already reserved/);
+	assert.equal(other.manager()!.runningCount, 0);
+	assert.equal(existsSync(join(other.dir, "must-not-consume")), false);
+});
+
+test("reload gap preserves subscription capture, canonical key and deadline, new host only", async t => {
+	const dir = tempDir(t);
+	const id = randomUUID();
+	const old = fakePi(false, id);
+	let manager!: JobManager;
+	createJobsExtension({ logRoot: dir, subscriptions: true, env: {}, killGraceMs: 10, minIntervalSeconds: 0.01, onManager: m => manager = m })(old.pi as any);
+	await old.emit("session_start", { reason: "new" });
+	await old.call("job_subscribe", { check: "sleep 0.1; printf RELOAD-MATCH", lane: "L1", inboxDir: dir, intervalSeconds: 0.01, timeoutSeconds: 2 }, dir);
+	const deadline = manager.get("j1")!.deadline;
+	await old.emit("session_shutdown", { reason: "reload" });
+	await waitUntil(() => manager.get("j1")?.matchSequence === 1);
+	assert.equal(old.sent.length, 0);
+	const fresh = fakePi(false, id);
+	createJobsExtension({ logRoot: dir, subscriptions: true, env: {} })(fresh.pi as any);
+	t.after(() => fresh.emit("session_shutdown", { reason: "quit" }));
+	await fresh.emit("session_start", { reason: "reload" });
+	await waitUntil(() => fresh.sent.length === 1);
+	assert.equal(old.sent.length, 0);
+	assert.match(fresh.sent[0].message.content[0].text, /RELOAD-MATCH$/);
+	assert.equal(manager.get("j1")!.deadline, deadline);
+	await fresh.call("job_kill", { id: "j1" }, dir);
+});
+
+test("subscription capability is probed without refusing ordinary pre-feature owners", async t => {
+	const f = setup(t, { subscriptions: true, env: {} });
+	await f.emit("session_start", { reason: "new" });
+	Object.defineProperty(f.manager(), "subscriptionProtocol", { value: undefined });
+	await assert.rejects(f.call("job_subscribe", { check: "true", lane: "L1", inboxDir: f.dir, intervalSeconds: 1, timeoutSeconds: 5 }, f.dir), /lacks subscription capability/);
+	await f.call("job_start", { command: "true", timeoutSeconds: 5 }, f.dir);
+});
+
+test("invalid subscription status stops production and emits one nonwaking diagnostic across all boundaries", async t => {
+	const f = setup(t, { subscriptions: true, env: {} });
+	await f.emit("session_start", { reason: "new" });
+	f.state.idle = false;
+	await f.emit("agent_start", {});
+	await f.call("job_subscribe", { check: "printf immutable", lane: "L1", inboxDir: f.dir, intervalSeconds: 0.1, timeoutSeconds: 5 }, f.dir);
+	await waitUntil(() => f.manager()!.get("j1")?.matchSequence === 1);
+	mkdirSync(join(f.dir, "status"));
+	writeFileSync(join(f.dir, "status/L1.status"), "unparseable");
+	writeFileSync(f.manager()!.get("j1")!.logPath, "MUTATED-LOG");
+	await f.emit("agent_end", {});
+	f.state.idle = true;
+	for (const event of ["agent_settled", "session_compact_failed", "session_compact", "session_tree"]) await f.emit(event, {});
+	await new Promise(r => setImmediate(r));
+	assert.equal(f.sent.length, 1);
+	assert.equal(f.sent[0].message.customType, "pi-jobs-subscription-error");
+	assert.equal(f.sent[0].options.triggerTurn, false);
+	assert.equal(f.manager()!.get("j1")!.status, "failed");
+	assert.equal(f.manager()!.get("j1")!.checks, 1);
+	writeFileSync(join(f.dir, "status/L1.status"), "working since 2020-01-01T00:00:00Z\n");
+	await f.emit("session_compact_failed", {});
+	await waitUntil(() => f.sent.length === 2);
+	const content = JSON.stringify(f.sent[1].message.content);
+	assert.match(content, /immutable/);
+	assert.doesNotMatch(content, /MUTATED-LOG/);
+	assert.equal(f.sent[1].message.details.completions.length, 2);
+	assert.equal(f.sent[1].message.details.completions[0].event, "match");
+	assert.equal(f.sent[1].message.details.completions[1].event, "terminal");
+});
+
+test("direct job_output calls reject fractions instead of rounding", async t => {
+	const f = setup(t);
+	await f.call("job_start", { command: "true", timeoutSeconds: 5 }, f.dir);
+	for (const tailLines of [2.5, 200.9]) await assert.rejects(f.call("job_output", { id: "j1", tailLines }, f.dir));
+	for (const tailLines of [1, 2, 200]) await f.call("job_output", { id: "j1", tailLines }, f.dir);
 });
 
 test("job_start → completion message wakes the agent exactly once", async t => {
@@ -403,6 +511,7 @@ test("tool schemas enforce the bounds through pi's own argument validation", { s
 	bad("job_watch", { check: "true", intervalSeconds: 10, timeoutSeconds: 60, until: "sometimes" });
 	ok("job_output", { id: "j1", tailLines: 200 });
 	bad("job_output", { id: "j1", tailLines: 2.5 });
+	bad("job_output", { id: "j1", tailLines: 200.9 });
 	bad("job_output", { id: "j1", tailLines: 201 });
 	bad("job_output", { id: "j1", tailLines: 0 });
 	assert.match(tools.get("job_watch").parameters.properties.checkTimeoutSeconds.description, /Default: min\(120, timeoutSeconds\)/);
