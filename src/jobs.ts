@@ -180,7 +180,7 @@ interface Job {
 	done: Promise<void>;
 	resolveDone: () => void;
 	baseline?: string;
-	subscription?: { reservation: SubscriptionReservation; options: SubscriptionOptions; env: NodeJS.ProcessEnv };
+	subscription?: { reservation: SubscriptionReservation; options: SubscriptionOptions; env: NodeJS.ProcessEnv; captureCheck?: () => ImmutableCapture };
 }
 
 /**
@@ -366,7 +366,7 @@ export class JobManager {
 		for (const job of jobs) job.run?.dispose();
 		for (const job of [...this.running.values()]) {
 			job.notify = !!job.subscription && retainedDiagnostic !== undefined;
-			this.settle(job, job.notify ? "failed" : "killed");
+			this.settle(job, job.notify ? "failed" : "killed", {}, job.subscription?.captureCheck?.());
 		}
 		for (const run of this.runs) run.dispose();
 	}
@@ -501,6 +501,8 @@ export class JobManager {
 		}
 		const n = (job.snap.checks = (job.snap.checks ?? 0) + 1);
 		const sink = new TailSink(subscription ? Math.min(this.opts.checkOutputBytes, RECORD_BYTES) : this.opts.checkOutputBytes);
+		// Forced shutdown must freeze the in-flight sink before settling, not wait for pipe callbacks.
+		if (subscription) subscription.captureCheck = () => captureOutput(sink.toBuffer(), sink.dropped);
 		// Full-stream digests for until:"change" (the sink keeps only a bounded tail). One per
 		// stream, so nondeterministic stdout/stderr interleaving cannot look like a change.
 		const outHash = createHash("sha256");
@@ -514,6 +516,8 @@ export class JobManager {
 				job.timers.delete(checkTimer);
 			}
 			if (job.run === run) job.run = undefined;
+			if (subscription) subscription.captureCheck = undefined;
+			if (job.snap.status !== "running") return;
 			if (outcome.error) sink.push(Buffer.from(`pi-jobs: failed to run check: ${outcome.error}\n`));
 			const raw = sink.toBuffer();
 			const output = tailBuffer(raw, 1000, this.opts.checkOutputBytes, !sink.dropped).text;
@@ -546,6 +550,7 @@ export class JobManager {
 				options.check,
 				options.cwd,
 				(chunk, stream) => {
+					if (job.snap.status !== "running") return;
 					(stream === "err" ? errHash : outHash).update(chunk);
 					sink.push(chunk);
 				},
@@ -617,6 +622,7 @@ export class JobManager {
 		job.resolveDone();
 		this.updateActive();
 		if (job.subscription) {
+			job.subscription.captureCheck = undefined;
 			const reservation = job.subscription.reservation;
 			reservation.snapshot = { ...job.snap, lastCheck: job.snap.lastCheck && { ...job.snap.lastCheck, output: "" } };
 			const record = job.notify ? this.subscriptionRecord(job, "terminal", capture) : undefined;

@@ -7,6 +7,7 @@ import { captureOutput, classifyInboxExit, declaredIdentity, laneStatus, RECORD_
 import { expireReloadOwner, reserveSubscription, sessionOwners, stopOrphans, subscriptionReservations, type Owner } from "../src/ownership.ts";
 import { Delivery, type Completion } from "../src/delivery.ts";
 import { LogWriter } from "../src/logwriter.ts";
+import { TailSink } from "../src/tail.ts";
 import { JobManager, type JobSnapshot } from "../src/jobs.ts";
 import { sleep, waitUntil as waitFor } from "./helpers.ts";
 import { tempDir } from "./helpers.ts";
@@ -388,6 +389,83 @@ test("retired stale and expired handoff records remain discoverable after manage
 		assert.equal(subscriptionReservations().size, 0);
 	}
 });
+
+for (const mode of ["stale owner", "expired handoff", "intentional shutdown"] as const) {
+	test(`${mode} finalizes an in-flight subscription without losing or republishing captured bytes`, async t => {
+		const dir = tempDir(t);
+		const sessionId = crypto.randomUUID();
+		const expected = Buffer.concat([Buffer.from("CAPTURED"), Buffer.from([0, 255, 128, 10])]);
+		const chunks: Buffer[] = [];
+		const push = TailSink.prototype.push;
+		t.mock.method(TailSink.prototype, "push", function(this: TailSink, chunk: Buffer) {
+			chunks.push(Buffer.from(chunk));
+			push.call(this, chunk);
+		});
+		const published: any[] = [];
+		const manager = new JobManager({ logRoot: dir, env: {}, keepFinished: 0, killGraceMs: 5000, drainMs: 10,
+			onTerminal: () => assert.fail("ordinary completion"), onSubscription: record => published.push(record) });
+		manager.bindSession(sessionId);
+		const delivery = new Delivery<JobSnapshot>({ isIdle: () => false, aborted: () => false, send: () => assert.fail("retired send") });
+		const owner: Owner = { version: 2, manager, delivery, token: mode === "expired handoff" ? undefined : {}, alive: () => false };
+		sessionOwners().set(sessionId, owner);
+		t.after(async () => {
+			clearTimeout(owner.reloadTimer);
+			sessionOwners().delete(sessionId);
+			delivery.dispose();
+			await manager.shutdown(20);
+			manager.reconcileSubscriptions();
+		});
+		const job = manager.subscribe({ sessionId, lane: "L1", inboxDir: dir, cwd: dir,
+			check: "trap '' TERM; printf 'CAPTURED\\000\\377\\200\\n'; sleep 30",
+			intervalSeconds: 0.01, timeoutSeconds: 30, checkTimeoutSeconds: 30 });
+		await waitFor(() => Buffer.concat(chunks).length === expected.length);
+		assert.deepEqual(Buffer.concat(chunks), expected); // Real supervisor output has reached the in-memory sink.
+		assert.equal(published.length, 0);
+		const reservation = [...subscriptionReservations().values()].find(r => r.snapshot?.logPath === job.logPath)!;
+		assert.equal(reservation.records.length, 0);
+		if (mode === "stale owner") await stopOrphans();
+		else if (mode === "expired handoff") {
+			expireReloadOwner(sessionId, owner, 5);
+			await waitFor(() => reservation.snapshot?.status === "failed");
+		} else await manager.shutdown(20);
+		await waitFor(() => !manager.ownsProcesses); // Reap/pipe callbacks must not publish a second record.
+		if (mode === "intentional shutdown") {
+			assert.equal(published.length, 0);
+			assert.equal(reservation.records.length, 0);
+			assert.equal(subscriptionReservations().has(reservation.key), false);
+			return;
+		}
+		assert.equal(reservation.records.length, 1);
+		const terminal = reservation.records[0];
+		assert.equal(terminal.event, "terminal");
+		assert.equal(terminal.payload.status, "failed");
+		assert.equal(terminal.payload.killedBy, "shutdown");
+		assert.match(terminal.payload.error!, /retained for explicit reconciliation/);
+		assert.equal(terminal.sequence, 0);
+		assert.ok(terminal.capture, "forced retirement must retain the in-flight sink");
+		assert.deepEqual(Buffer.from(terminal.capture.data, "latin1"), expected);
+		assert.equal(terminal.capture.bytes, expected.length);
+		assert.equal(terminal.capture.truncated, false);
+		assert.ok(Object.isFrozen(terminal.capture));
+		assert.ok(Object.isFrozen(terminal));
+		assert.deepEqual(published, [terminal]);
+		writeFileSync(job.logPath, "not the captured output");
+		await manager.shutdown(20, "retired again");
+		assert.equal(reservation.records[0], terminal);
+		assert.deepEqual(published, [terminal]);
+		assert.deepEqual(Buffer.from(terminal.capture.data, "latin1"), expected);
+		const fresh = new JobManager({ logRoot: dir, env: {}, onTerminal: () => {} });
+		fresh.bindSession(sessionId);
+		assert.equal(fresh.get(job.id)?.status, "failed");
+		assert.throws(() => fresh.subscribe({ sessionId, lane: "L1", inboxDir: dir, cwd: dir, check: "true",
+			intervalSeconds: 0.01, timeoutSeconds: 1, checkTimeoutSeconds: 1 }), /reserved/);
+		assert.equal(subscriptionReservations().has(reservation.key), true);
+		assert.equal(reservation.confirm(terminal.completionId), true);
+		assert.equal(reservation.confirm(terminal.completionId), false);
+		assert.equal(subscriptionReservations().has(reservation.key), false);
+		await fresh.shutdown(20);
+	});
+}
 
 test("parked expiry retains match and terminal through replacement attempts and finished pruning", async t => {
 	const dir = tempDir(t);
