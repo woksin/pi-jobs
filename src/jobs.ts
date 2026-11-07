@@ -41,6 +41,10 @@ export interface JobSnapshot {
 	/** Configured delay between watch checks; absent for plain commands. */
 	intervalSeconds?: number;
 	checks?: number;
+	/** Opt-in number of empty timeout periods before waking. */
+	quietTimeouts?: number;
+	/** Empty periods silently re-armed so far. */
+	quietRearms?: number;
 	lastCheck?: CheckResult;
 	/** The log hit its size cap; later output was discarded. */
 	logTruncated?: boolean;
@@ -71,9 +75,10 @@ export interface WatchOptions {
 	checkTimeoutSeconds: number;
 	until: WatchUntil;
 	label?: string;
+	quietTimeouts?: number;
 }
 
-export interface SubscriptionOptions extends Omit<WatchOptions, "until"> {
+export interface SubscriptionOptions extends Omit<WatchOptions, "until" | "quietTimeouts"> {
 	sessionId: string;
 	lane: string;
 	inboxDir: string;
@@ -180,6 +185,7 @@ interface Job {
 	done: Promise<void>;
 	resolveDone: () => void;
 	baseline?: string;
+	quiet?: { max: number; done: number };
 	subscription?: { reservation: SubscriptionReservation; options: SubscriptionOptions; env: NodeJS.ProcessEnv; captureCheck?: () => ImmutableCapture };
 }
 
@@ -264,6 +270,12 @@ export class JobManager {
 		job.snap.until = options.until;
 		job.snap.intervalSeconds = options.intervalSeconds;
 		job.snap.checks = 0;
+		if (options.quietTimeouts !== undefined && options.quietTimeouts > 1) {
+			job.quiet = { max: options.quietTimeouts, done: 0 };
+			job.snap.quietTimeouts = options.quietTimeouts;
+			job.snap.quietRearms = 0;
+			job.snap.deadline = job.snap.startedAt + options.quietTimeouts * options.timeoutSeconds * 1000;
+		}
 		try {
 			job.log = new LogWriter(job.snap.logPath, this.opts.logCapBytes);
 			job.log.write(`# pi-jobs watch until ${options.until}: ${options.check}\n`);
@@ -272,8 +284,35 @@ export class JobManager {
 			this.discard(job);
 			throw err;
 		}
-		this.addTimer(job, options.timeoutSeconds * 1000, () => this.stop(job, "timeout"));
+		this.armPeriod(job, options);
 		return { ...job.snap };
+	}
+
+	private armPeriod(job: Job, options: WatchOptions): void {
+		const quiet = job.quiet;
+		const delay = quiet
+			? Math.max(0, job.snap.startedAt + (quiet.done + 1) * options.timeoutSeconds * 1000 - Date.now())
+			: options.timeoutSeconds * 1000;
+		this.addTimer(job, delay, () => {
+			if (this.closed) return;
+			if (job.snap.status !== "running" || job.pending !== undefined) return;
+			if (quiet && this.canQuietRearm(job)) {
+				job.snap.quietRearms = ++quiet.done;
+				job.log?.write(`# pi-jobs quiet re-arm ${quiet.done}/${quiet.max}\n`);
+				this.armPeriod(job, options);
+				return;
+			}
+			this.stop(job, "timeout");
+		});
+	}
+
+	private canQuietRearm(job: Job): boolean {
+		const quiet = job.quiet;
+		if (!quiet || quiet.done + 1 >= quiet.max) return false;
+		const last = job.snap.lastCheck;
+		if (!last || last.timedOut) return false;
+		// No verdict (including a spawn error or direct signal) is not an empty check.
+		return last.exitCode !== null && last.signal === null;
 	}
 
 	/** Reserve the declared consumer before opening logs or starting a consuming subprocess. */

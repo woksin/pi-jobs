@@ -509,6 +509,8 @@ test("tool schemas enforce the bounds through pi's own argument validation", { s
 	bad("job_watch", { check: "true", intervalSeconds: 3601, timeoutSeconds: 60 });
 	bad("job_watch", { check: "true", intervalSeconds: 10, timeoutSeconds: 60, checkTimeoutSeconds: 0 });
 	bad("job_watch", { check: "true", intervalSeconds: 10, timeoutSeconds: 60, until: "sometimes" });
+	ok("job_watch", { check: "true", intervalSeconds: 10, timeoutSeconds: 60, quietTimeouts: 24 });
+	for (const quietTimeouts of [0, 1.5, 25]) bad("job_watch", { check: "true", intervalSeconds: 10, timeoutSeconds: 60, quietTimeouts });
 	ok("job_output", { id: "j1", tailLines: 200 });
 	bad("job_output", { id: "j1", tailLines: 2.5 });
 	bad("job_output", { id: "j1", tailLines: 200.9 });
@@ -561,6 +563,77 @@ test("reload keeps a watch's original deadline and change baseline", async t => 
 	await next.emit("session_start", { reason: "reload" });
 	await waitUntil(() => next.sent.length === 1, 800, "original watch deadline");
 	assert.equal(next.sent[0].message.details.completions[0].job.status, "timed_out");
+});
+
+test("quiet watch re-arms without sending and reload preserves its counter and overall deadline", async t => {
+	const dir = tempDir(t), id = randomUUID();
+	const old = fakePi(false, id), next = fakePi(false, id);
+	let manager!: JobManager;
+	const options = { logRoot: join(dir, "logs"), killGraceMs: 50, drainMs: 50, minIntervalSeconds: 0.05, onManager: (m: JobManager) => manager = m };
+	createJobsExtension(options)(old.pi as any);
+	await old.emit("session_start", { reason: "startup" });
+	const started = await old.call("job_watch", { check: "echo unchanged", until: "change", intervalSeconds: 0.05, timeoutSeconds: 1, quietTimeouts: 3 }, dir);
+	const job = started.details;
+	assert.match(started.content[0].text, /quiet re-arm up to 3 periods, overall deadline/);
+	assert.equal(job.deadline, job.startedAt + 3000);
+	await waitUntil(() => manager.get(job.id)?.quietRearms === 1);
+	assert.equal(old.sent.length, 0);
+	await old.emit("session_shutdown", { reason: "reload" });
+	const originalManager = manager;
+	createJobsExtension(options)(next.pi as any);
+	t.after(() => next.emit("session_shutdown", { reason: "quit" }));
+	await next.emit("session_start", { reason: "reload" });
+	assert.equal(manager, originalManager);
+	const listed = await next.call("job_list", {}, dir);
+	assert.equal(listed.details.jobs[0].id, job.id);
+	assert.equal(listed.details.jobs[0].quietRearms, 1);
+	assert.equal(listed.details.jobs[0].deadline, job.deadline);
+	await waitUntil(() => manager.get(job.id)?.quietRearms === 2);
+	assert.equal(next.sent.length, 0);
+	await waitUntil(() => next.sent.length === 1, 1800, "original overall deadline");
+	const completed = next.sent[0].message.details.completions[0].job;
+	assert.equal(completed.status, "timed_out");
+	assert.equal(completed.quietRearms, 2);
+	assert.equal(completed.deadline, job.deadline);
+	assert.ok(completed.endedAt >= job.deadline - 50 && completed.endedAt < job.deadline + 800);
+	assert.match(next.sent[0].message.content[0].text, /timeout 1s x 3 periods/);
+	assert.equal(old.sent.length, 0);
+});
+
+test("quietTimeouts validates integer, count and total deadline bounds and is not a subscription parameter", async t => {
+	const f = setup(t, { subscriptions: true });
+	const params = { check: "exit 1", intervalSeconds: 0.1, timeoutSeconds: 1 };
+	for (const quietTimeouts of [0, -1, 1.5, 25, "2", null]) {
+		await assert.rejects(f.call("job_watch", { ...params, quietTimeouts }, f.dir), /quietTimeouts must be an integer between 1 and 24/);
+	}
+	await assert.rejects(f.call("job_watch", { ...params, timeoutSeconds: 14400, quietTimeouts: 7 }, f.dir), /quietTimeouts x timeoutSeconds must not exceed 86400 seconds/);
+	assert.equal(f.manager()!.runningCount, 0);
+	const limit = await f.call("job_watch", { ...params, timeoutSeconds: 14400, quietTimeouts: 6 }, f.dir);
+	assert.equal(limit.details.deadline, limit.details.startedAt + 86400000);
+	assert.equal(f.tools.get("job_watch").parameters.properties.quietTimeouts.type, "integer");
+	assert.equal(f.tools.get("job_subscribe").parameters.properties.quietTimeouts, undefined);
+	for (const quietTimeouts of [undefined, 1]) {
+		const started = await f.call("job_watch", { ...params, quietTimeouts }, f.dir);
+		assert.doesNotMatch(started.content[0].text, /quiet re-arm/);
+		await waitUntil(() => f.sent.some(s => s.message.details.completions.some((c: any) => c.job.id === started.details.id)));
+		const completed = f.manager()!.get(started.details.id)!;
+		assert.equal(completed.status, "timed_out");
+		assert.equal(completed.quietRearms, undefined);
+	}
+});
+
+test("job_kill and shutdown cancel a quiet watch without a wake", async t => {
+	for (const stop of ["job_kill", "shutdown"]) {
+		const f = setup(t, { minIntervalSeconds: 0.05 });
+		const started = await f.call("job_watch", { check: "exit 1", intervalSeconds: 0.05, timeoutSeconds: 1, quietTimeouts: 3 }, f.dir);
+		await waitUntil(() => f.manager()!.get(started.details.id)?.quietRearms === 1);
+		if (stop === "job_kill") await f.call("job_kill", { id: started.details.id }, f.dir);
+		else await f.emit("session_shutdown", { reason: "quit" });
+		await sleep(1100);
+		assert.equal(f.sent.length, 0);
+		assert.equal(f.manager()!.get(started.details.id)?.status, "killed");
+		assert.equal(f.manager()!.get(started.details.id)?.quietRearms, 1);
+	}
 });
 
 test("a legacy upgrade that stops work without a handoff reports every full command in model context", async t => {

@@ -66,7 +66,7 @@ sensitive output, so do not publish them.
 | Tool | Purpose |
 |---|---|
 | `job_start { command, timeoutSeconds, cwd?, label? }` | Run `bash -c <command>` under a supervisor in its own process group; stdout+stderr → log file. Returns at once with id and log path. |
-| `job_watch { check, intervalSeconds, timeoutSeconds, until?, checkTimeoutSeconds?, cwd?, label? }` | Re-run `check` every `intervalSeconds` until the condition holds or `timeoutSeconds` passes. |
+| `job_watch { check, intervalSeconds, timeoutSeconds, quietTimeouts?, until?, checkTimeoutSeconds?, cwd?, label? }` | Re-run `check` every `intervalSeconds` until the condition holds or `timeoutSeconds` passes; optionally re-arm empty timeout periods silently. |
 | `job_list {}` | Running and recent jobs of this session. |
 | `job_output { id, tailLines? }` | Bounded log tail (default 40, max 200 lines, max 16 KB). |
 | `job_kill { id }` | SIGTERM the job's process group, SIGKILL after 5 s; returns the final state. |
@@ -86,6 +86,27 @@ A check that exceeds `checkTimeoutSeconds` (default `min(120, timeoutSeconds)`) 
 group killed and counts as **inconclusive**: it never matches, never sets the `change`
 baseline, and the watch continues. The interval is measured from the end of one check to the
 start of the next. Prefer `job_start` with a native blocking watcher where one exists.
+
+### Quiet re-arm
+
+For waits where an empty timeout needs no action, set `quietTimeouts: N` (integer 1–24).
+The same watch silently re-arms empty periods and wakes on a match, an inconclusive last
+check at a period boundary, or the N-th empty timeout. A non-zero exit for `until: "success"`
+is an ordinary empty check, not an error. Omitting the option or setting it to 1 keeps the
+usual first-timeout wake.
+
+The overall deadline is `N x timeoutSeconds` from the original start, capped at 24 hours
+(86400 seconds). For example, `timeoutSeconds: 3600, quietTimeouts: 4` waits up to four hours
+without empty-timeout model turns. `job_list` snapshots expose `quietTimeouts`, `quietRearms`
+and `deadline`; the timeout wake reports the elapsed number of periods. The id, log, check
+count and original `until: "change"` baseline are kept. A check already running at a quiet
+boundary continues under its own per-check timeout; the final deadline stops it as usual.
+`job_kill` and session shutdown cancel re-arms silently.
+
+Same-process compatible `/reload` adoption preserves the counter and original overall
+deadline, just like other watches; this is not restart/crash persistence. For a blocked
+lane, keep `quietTimeouts x timeoutSeconds` within its waiting-on lease so the lease can be
+renewed at the wake (for a 60-minute lease, at most 3600 seconds).
 
 ### CI
 
