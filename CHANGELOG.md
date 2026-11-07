@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0
+
+### Added
+- Opt-in `quietTimeouts` silently re-arms empty watch timeout periods under the same id, preserving the change baseline and overall deadline across same-process reload. Watches wake on a match, an inconclusive check at a period boundary, or the final timeout.
+- Quiet watch snapshots expose re-arm counts and the overall deadline; timeout notifications report the number of periods.
+
 ## 0.4.0
 
 ### Added

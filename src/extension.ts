@@ -72,6 +72,7 @@ export function watchParams(minInterval = MIN_INTERVAL_SECONDS) {
 			check: { type: "string", minLength: 1, description: "Check command (bash -c), run repeatedly." },
 			intervalSeconds: { type: "number", minimum: minInterval, maximum: MAX_INTERVAL_SECONDS, description: `Delay between checks in seconds (${minInterval}–${MAX_INTERVAL_SECONDS}).` },
 			timeoutSeconds: timeoutSchema(`Give up after this many seconds (1–${MAX_TIMEOUT_SECONDS}).`),
+			quietTimeouts: { type: "integer", minimum: 1, maximum: 24, description: "Opt-in empty timeout periods before waking (default: 1). Use when an empty timeout needs no action; wakes on match, inconclusive check at a period boundary, or the N-th empty timeout. Total quiet window must be at most 86400 seconds and within the lane lease so it can be renewed." },
 			until: {
 				type: "string",
 				enum: ["success", "failure", "change"],
@@ -90,7 +91,7 @@ export function watchParams(minInterval = MIN_INTERVAL_SECONDS) {
 
 export function subscribeParams(minInterval = MIN_INTERVAL_SECONDS) {
 	const watch = watchParams(minInterval);
-	const { until: _until, ...properties } = watch.properties;
+	const { until: _until, quietTimeouts: _quietTimeouts, ...properties } = watch.properties;
 	return { ...watch, properties: { ...properties,
 		check: { type: "string", minLength: 1, description: "Trusted consuming inbox check: exit 0 match, 1 quiet, anything else stops with an error. Must honor the declared inboxDir/lane." },
 		lane: { type: "string", pattern: "^[A-Z][A-Z0-9-]{0,15}$", description: "Marker lane token; must agree with known lane identity." },
@@ -121,6 +122,15 @@ function seconds(value: unknown, name: string, min: number, max: number, unit = 
 	if (typeof n !== "number" || !Number.isFinite(n)) throw new Error(`${name} must be a number (${unit}).`);
 	if (n < min || n > max) throw new Error(`${name} must be between ${min} and ${max} ${unit} (got ${n}).`);
 	return n;
+}
+
+function quietTimeoutCount(value: unknown = 1, timeoutSeconds: number): number {
+	const invalid = "quietTimeouts must be an integer between 1 and 24.";
+	if (!Number.isInteger(value)) throw new Error(invalid);
+	const count = value as number;
+	if (count < 1 || count > 24) throw new Error(invalid);
+	if (count * timeoutSeconds > 86400) throw new Error("quietTimeouts x timeoutSeconds must not exceed 86400 seconds.");
+	return count;
 }
 
 function text(value: unknown, name: string): string {
@@ -404,17 +414,21 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			description:
 				"Re-run a check command in the background every intervalSeconds until a condition holds or timeoutSeconds passes, with no model involvement. " +
 				"Use when no blocking watcher exists (prefer job_start with e.g. `gh run watch <run-id> --exit-status` when one does). " +
+				"Set quietTimeouts for waits where an empty timeout needs no action: wakes on match, an inconclusive check at a period boundary, or the N-th empty timeout. " +
+				"The quietTimeouts x timeoutSeconds window must fit within the lane lease so it can be renewed at the wake. " +
 				`You are woken with the result and the last check's output. ${WAKE_NOTE}`,
 			parameters: watchParams(minInterval) as any,
 			async execute(_id: string, params: any, _signal: unknown, _onUpdate: unknown, ctx: { cwd: string }) {
 				remember(ctx);
 				const timeoutSeconds = seconds(params.timeoutSeconds, "timeoutSeconds", 1, MAX_TIMEOUT_SECONDS);
+				const quietTimeouts = quietTimeoutCount(params.quietTimeouts, timeoutSeconds);
 				const until: WatchUntil = params.until ?? "success";
 				if (!["success", "failure", "change"].includes(until)) throw new Error("until must be success, failure or change.");
 				const job = manager.watch({
 					check: text(params.check, "check"),
 					intervalSeconds: seconds(params.intervalSeconds, "intervalSeconds", minInterval, MAX_INTERVAL_SECONDS),
 					timeoutSeconds,
+					quietTimeouts,
 					checkTimeoutSeconds:
 						params.checkTimeoutSeconds == null
 							? Math.min(DEFAULT_CHECK_TIMEOUT_SECONDS, timeoutSeconds)
@@ -424,7 +438,8 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 					label: typeof params.label === "string" ? params.label : undefined,
 				});
 				return result(
-					`Started watch ${job.id} (${jobTitle(job)}) until ${until}, every ${params.intervalSeconds}s, timeout ${timeoutSeconds}s.\n` +
+					`Started watch ${job.id} (${jobTitle(job)}) until ${until}, every ${params.intervalSeconds}s, timeout ${timeoutSeconds}s` +
+						(job.quietTimeouts ? `, quiet re-arm up to ${job.quietTimeouts} periods, overall deadline ${new Date(job.deadline!).toISOString()}` : "") + `.\n` +
 						`log: ${job.logPath}\nEnd your turn now; you will be woken when it finishes.`,
 					brief(job),
 				);
