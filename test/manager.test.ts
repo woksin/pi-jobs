@@ -114,6 +114,108 @@ test("watch matches after the file appears (N checks)", async t => {
 	assert.match(readFileSync(job.logPath, "utf8"), /--- check 1 · .* · exit 1 ---/);
 });
 
+test("watch without quietTimeouts or with one period wakes at the first timeout", async t => {
+	for (const quietTimeouts of [undefined, 1]) {
+		const { dir, done, manager } = setup(t);
+		const job = manager.watch({ ...watchDefaults, check: "echo pending; exit 1", cwd: dir, timeoutSeconds: 0.6, quietTimeouts });
+		await waitUntil(() => done.length === 1);
+		assert.equal(done[0].id, job.id);
+		assert.equal(done[0].status, "timed_out");
+		assert.equal(done[0].quietRearms, undefined);
+		assert.equal(done[0].deadline, undefined);
+		assert.ok(done[0].endedAt! - job.startedAt >= 550);
+		assert.doesNotMatch(readLog(job.logPath), /quiet re-arm/);
+	}
+});
+
+test("quiet timeout keeps the id, checks and change baseline, then wakes on a later match", async t => {
+	const { dir, done, manager } = setup(t);
+	writeFileSync(join(dir, "state"), "pending");
+	const job = manager.watch({ ...watchDefaults, check: "cat state", cwd: dir, until: "change", timeoutSeconds: 0.8, quietTimeouts: 4 });
+	assert.equal(job.quietTimeouts, 4);
+	assert.equal(job.quietRearms, 0);
+	assert.equal(job.deadline, job.startedAt + 3200);
+	await waitUntil(() => manager.get(job.id)?.quietRearms === 1);
+	const rearmed = manager.get(job.id)!;
+	assert.equal(rearmed.status, "running");
+	assert.equal(done.length, 0);
+	const checks = rearmed.checks!;
+	await waitUntil(() => manager.get(job.id)!.checks! > checks);
+	assert.equal(done.length, 0, "unchanged output must still use the original baseline");
+	writeFileSync(join(dir, "state"), "ready");
+	await waitUntil(() => done.length === 1);
+	assert.equal(done[0].id, job.id);
+	assert.equal(done[0].status, "matched");
+	assert.equal(done[0].lastCheck?.output, "ready");
+	assert.equal(done[0].deadline, job.deadline);
+	assert.match(readLog(job.logPath), /# pi-jobs quiet re-arm 1\/4/);
+});
+
+test("quiet watch wakes only at the N-th empty period and clears its timers", async t => {
+	const { dir, done, manager } = setup(t);
+	const job = manager.watch({ ...watchDefaults, check: "echo pending; exit 1", cwd: dir, timeoutSeconds: 0.6, quietTimeouts: 3 });
+	await waitUntil(() => manager.get(job.id)?.quietRearms === 2);
+	assert.equal(done.length, 0);
+	await waitUntil(() => done.length === 1);
+	assert.equal(done[0].status, "timed_out");
+	assert.equal(done[0].quietRearms, 2);
+	const elapsed = done[0].endedAt! - job.startedAt;
+	assert.ok(elapsed >= 1750 && elapsed < 2800, `elapsed=${elapsed}`);
+	assert.equal((manager as any).finished[0].timers.size, 0);
+	await sleep(650);
+	assert.equal(done.length, 1);
+});
+
+test("quiet watch does not re-arm an inconclusive check at the period boundary", async t => {
+	for (const check of ["sleep 30", "kill -KILL -$PPID", "exit 1"]) {
+		const { dir, done, manager } = setup(t, check === "exit 1" ? { env: { PATH: "/no-bash-here" } } : {});
+		const job = manager.watch({ ...watchDefaults, check, cwd: dir, intervalSeconds: 2, checkTimeoutSeconds: 0.1, timeoutSeconds: 0.9, quietTimeouts: 3 });
+		await waitUntil(() => done.length === 1);
+		assert.equal(done[0].status, "timed_out");
+		assert.equal(done[0].quietRearms, 0);
+		assert.ok(done[0].endedAt! - job.startedAt < 1800);
+		assert.ok(done[0].lastCheck?.timedOut || done[0].lastCheck?.exitCode === null);
+	}
+});
+
+test("quiet watch with no completed check wakes at the first boundary", async t => {
+	const { dir, done, manager } = setup(t);
+	const job = manager.watch({ ...watchDefaults, check: "sleep 30", cwd: dir, checkTimeoutSeconds: 30, timeoutSeconds: 0.6, quietTimeouts: 3 });
+	await waitUntil(() => done.length === 1);
+	assert.equal(done[0].status, "timed_out");
+	assert.equal(done[0].quietRearms, 0);
+	assert.equal(done[0].lastCheck?.timedOut, true);
+	assert.ok(done[0].endedAt! - job.startedAt < 1600);
+});
+
+test("quiet period leaves an in-flight check running until the overall deadline", async t => {
+	const { dir, done, manager } = setup(t);
+	const job = manager.watch({ ...watchDefaults, check: "if [ -f seen ]; then sleep 30; fi; touch seen; exit 1", cwd: dir, timeoutSeconds: 0.8, checkTimeoutSeconds: 30, quietTimeouts: 2 });
+	await waitUntil(() => manager.get(job.id)?.quietRearms === 1);
+	assert.equal(done.length, 0);
+	assert.equal(manager.get(job.id)?.checks, 2);
+	await waitUntil(() => done.length === 1);
+	assert.equal(done[0].status, "timed_out");
+	assert.equal(done[0].lastCheck?.exitCode, 1);
+});
+
+test("kill and shutdown stay silent and cancel quiet re-arms", async t => {
+	for (const stop of ["kill", "shutdown"]) {
+		const { dir, done, manager } = setup(t);
+		const job = manager.watch({ ...watchDefaults, check: "exit 1", cwd: dir, timeoutSeconds: 0.6, quietTimeouts: 3 });
+		await waitUntil(() => manager.get(job.id)?.quietRearms === 1);
+		if (stop === "kill") await manager.kill(job.id);
+		else await manager.shutdown(200);
+		const stopped = manager.get(job.id)!;
+		assert.equal(stopped.status, "killed");
+		assert.equal((manager as any).finished[0].timers.size, 0);
+		await sleep(650);
+		assert.equal(manager.get(job.id)?.checks, stopped.checks);
+		assert.equal(manager.get(job.id)?.quietRearms, 1);
+		assert.equal(done.length, 0);
+	}
+});
+
 test("watch until failure and until change", async t => {
 	const { dir, done, manager } = setup(t);
 	writeFileSync(join(dir, "state"), "pending");

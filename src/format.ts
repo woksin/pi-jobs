@@ -58,7 +58,7 @@ export function formatNotification(job: JobSnapshot, tail: Tail, now = Date.now(
 		if (exit) facts.push(exit);
 	}
 	facts.push(`after ${formatDuration(durationOf(job, now))}`);
-	if (job.status === "timed_out") facts.push(`timeout ${job.timeoutSeconds}s`);
+	if (job.status === "timed_out") facts.push(`timeout ${job.timeoutSeconds}s` + (job.quietTimeouts && job.quietTimeouts > 1 ? ` x ${(job.quietRearms ?? 0) + 1} periods` : ""));
 	head.push(facts.join(" · "));
 	if (job.label) head.push(`${job.kind !== "command" ? "check" : "command"}: ${oneLine(job.command, 200)}`);
 	head.push(`log: ${job.logPath}${job.logTruncated ? " (truncated at the size cap)" : ""}`);
