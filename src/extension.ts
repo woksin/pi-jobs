@@ -16,7 +16,7 @@ import { defaultLogRoot, pruneLogs } from "./logs.ts";
 import { expireReloadOwner, highestJobId, historicalRunningJobs, sessionOwners, stopOrphans, takeReloadOwner, type Owner } from "./ownership.ts";
 import type { WatchUntil } from "./watch.ts";
 import { laneStatus } from "./subscription.ts";
-import { tailBuffer } from "./tail.ts";
+import { tailBuffer, type Tail } from "./tail.ts";
 
 export { CUSTOM_TYPE };
 export const MAX_TIMEOUT_SECONDS = 4 * 3600;
@@ -26,7 +26,12 @@ export const DEFAULT_CHECK_TIMEOUT_SECONDS = 120;
 export const NOTIFY_LINES = 40;
 export const NOTIFY_BYTES = 4096;
 /** Total output budget of one wake-up message, shared by all completions in it. */
-export const BATCH_BYTES = 16 * 1024;
+export const BATCH_BYTES = 6 * 1024;
+/** Tail budget for a clean exit (code 0): the interesting part is the last few lines. */
+export const NOTIFY_OK_LINES = 5;
+export const NOTIFY_OK_BYTES = 512;
+const PHASE_PROGRESS = /^pi-phase: running .*elapsed=/;
+const PHASE_FINAL = /^pi-phase: log=/;
 export const OUTPUT_DEFAULT_LINES = 40;
 export const OUTPUT_MAX_LINES = 200;
 export const OUTPUT_BYTES = 16 * 1024;
@@ -162,6 +167,16 @@ function brief(job: JobSnapshot): JobSnapshot {
 }
 
 /** Per-completion output budget so that a batch's tails together stay within BATCH_BYTES. */
+/** Notification tail of a job; exit 0 gets a short tail without pi-phase progress lines. */
+export function jobNotificationTail(manager: JobManager, job: JobSnapshot, budget: number): Tail {
+	const tail = manager.notificationTail(job, NOTIFY_LINES, budget);
+	if (job.kind !== "command" || job.exitCode !== 0) return tail;
+	const lines = tail.text.split("\n").filter(l => !PHASE_PROGRESS.test(l));
+	const final = lines.length && PHASE_FINAL.test(lines[lines.length - 1]) ? lines.pop()! : undefined;
+	const short = tailBuffer(Buffer.from(lines.join("\n"), "utf8"), NOTIFY_OK_LINES - (final ? 1 : 0), Math.min(budget, NOTIFY_OK_BYTES) - (final ? Buffer.byteLength(final) + 1 : 0));
+	return { text: [short.text, final].filter(Boolean).join("\n"), truncated: tail.truncated || short.truncated };
+}
+
 export function tailBudget(count: number): number {
 	return Math.min(NOTIFY_BYTES, Math.floor(BATCH_BYTES / Math.max(1, count)));
 }
@@ -210,7 +225,7 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 				const budget = tailBudget(completions.length);
 				const items = completions.map(c => {
 					const record = c.subscription?.record;
-					const tail = record ? tailBuffer(Buffer.from(record.capture?.data ?? "", "latin1"), NOTIFY_LINES, budget, !record.capture?.truncated) : manager.notificationTail(c.payload, NOTIFY_LINES, budget);
+					const tail = record ? tailBuffer(Buffer.from(record.capture?.data ?? "", "latin1"), NOTIFY_LINES, budget, !record.capture?.truncated) : jobNotificationTail(manager, c.payload, budget);
 					return { job: c.payload, tail, event: record?.event };
 				});
 				const { parts, partOf } = formatBatch(items);
@@ -475,10 +490,10 @@ export function createJobsExtension(options: JobsExtensionOptions = {}) {
 			name: "job_list",
 			label: "List background jobs",
 			description: "List this session's background jobs and watches, running and recent. Not for waiting: completion wakes you automatically.",
-			parameters: { type: "object", properties: {}, additionalProperties: false } as any,
-			async execute() {
+			parameters: { type: "object", properties: { all: { type: "boolean", description: "List every finished job, not just the last 5." } }, additionalProperties: false } as any,
+			async execute(_id: string, params: any) {
 				const jobs = manager.list();
-				return result(formatJobList(jobs), { jobs: jobs.map(brief) });
+				return result(formatJobList(jobs, Date.now(), params?.all === true), { jobs: jobs.map(brief) });
 			},
 		} as any);
 

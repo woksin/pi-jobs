@@ -220,9 +220,26 @@ test("job_watch → matched notification with the last check output", async t =>
 	assert.match(res.content[0].text, /^Started watch j1 .* until success/);
 	await waitUntil(() => sent.length === 1, 5000, "notification");
 	const text = sent[0].message.content[0].text;
-	assert.match(text, /^Watch j1 matched: cat ready\nuntil success · \d+ checks · last check exit 0 · after/);
-	assert.match(text, /last check output:\nbuilt$/);
+	assert.match(text, /^Watch j1 matched \(cat ready, after [^)]+\): built$/);
+	assert.doesNotMatch(text, /until|checks|log:/);
 	assert.equal(sent[0].message.details.completions[0].job.lastCheck.output, ""); // bulky output kept out of details
+});
+
+test("exit 0 notification is short, drops pi-phase progress and keeps the final log line", async t => {
+	const { dir, call, sent } = setup(t);
+	await call("job_start", { command: "for i in 1 2 3 4 5 6 7 8; do echo line$i; done; echo 'pi-phase: running x elapsed=5s'; echo 'pi-phase: log=/l exit=0'", timeoutSeconds: 10 }, dir);
+	await waitUntil(() => sent.length === 1, 5000, "notification");
+	const lines = sent[0].message.content[0].text.split("\n");
+	const out = lines.slice(lines.indexOf("output (tail):") + 1);
+	assert.deepEqual(out, ["line5", "line6", "line7", "line8", "pi-phase: log=/l exit=0"]);
+});
+
+test("job_list all param", async t => {
+	const { dir, call } = setup(t);
+	for (let i = 0; i < 7; i++) await call("job_start", { command: "true", timeoutSeconds: 5 }, dir);
+	await sleep(500);
+	assert.match((await call("job_list", {}, dir)).content[0].text, /… 2 older finished/);
+	assert.doesNotMatch((await call("job_list", { all: true }, dir)).content[0].text, /older finished/);
 });
 
 test("validation errors are thrown as tool failures", async t => {

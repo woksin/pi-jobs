@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.0
+
+### Changed
+- Watch matches wake the agent with a compact one-line notification plus the last check output (≤10 lines / 1 KB); timeouts and failures keep full detail.
+- Exit-0 job notifications carry at most 5 lines / 512 bytes, without pi-phase progress lines.
+- Total wake-up output budget lowered to 6 KB.
+- `job_list` shows running jobs and the last 5 finished by default; new `all` parameter lists everything.
+
 ## 0.5.0
 
 ### Added

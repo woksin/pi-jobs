@@ -1,7 +1,7 @@
 /** Model- and user-facing text (pure). */
 import { constants } from "node:os";
 import type { JobSnapshot } from "./jobs.ts";
-import type { Tail } from "./tail.ts";
+import { tailBuffer, type Tail } from "./tail.ts";
 
 export function formatDuration(ms: number): string {
 	const s = Math.max(0, Math.round(ms / 1000));
@@ -41,6 +41,12 @@ function durationOf(job: JobSnapshot, now: number): number {
 
 /** The single completion notification that wakes the agent. */
 export function formatNotification(job: JobSnapshot, tail: Tail, now = Date.now(), event?: "match" | "terminal"): string {
+	if (job.kind === "watch" && job.status === "matched" && event !== "match") {
+		const head = `Watch ${job.id} matched (${jobTitle(job)}, after ${formatDuration(durationOf(job, now))})`;
+		if (tail.text === "") return `${head}.`;
+		const short = tailBuffer(Buffer.from(tail.text, "utf8"), 10, 1024);
+		return `${head}: ${short.text}`;
+	}
 	const kind = job.kind === "subscription" ? "Subscription" : job.kind === "watch" ? "Watch" : "Job";
 	const status = event === "match" ? `match #${job.matchSequence}` : job.status.replace("_", " ");
 	const head = [`${kind} ${job.id} ${status}: ${jobTitle(job)}`];
@@ -101,12 +107,17 @@ export function formatJobLine(job: JobSnapshot, now = Date.now()): string {
 	return `${parts.join(" · ")} — ${jobTitle(job)}`;
 }
 
-export function formatJobList(jobs: JobSnapshot[], now = Date.now()): string {
+const RECENT_FINISHED = 5;
+
+export function formatJobList(jobs: JobSnapshot[], now = Date.now(), all = false): string {
 	if (jobs.length === 0) return "No background jobs in this session.";
 	const running = jobs.filter(j => j.status === "running");
-	const done = jobs.filter(j => j.status !== "running");
+	const finished = jobs.filter(j => j.status !== "running");
+	const done = all ? finished : finished.slice(-RECENT_FINISHED);
+	const older = finished.length - done.length;
 	const out: string[] = [];
 	if (running.length) out.push(`Running (${running.length}):`, ...running.map(j => `  ${formatJobLine(j, now)}`));
 	if (done.length) out.push(`Recent (${done.length}):`, ...done.map(j => `  ${formatJobLine(j, now)}`));
+	if (older > 0) out.push(`… ${older} older finished (job_list all: true)`);
 	return out.join("\n");
 }
