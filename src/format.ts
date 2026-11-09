@@ -112,8 +112,9 @@ const RECENT_FINISHED = 5;
 export function formatJobList(jobs: JobSnapshot[], now = Date.now(), all = false): string {
 	if (jobs.length === 0) return "No background jobs in this session.";
 	const running = jobs.filter(j => j.status === "running");
-	const finished = jobs.filter(j => j.status !== "running");
-	const done = all ? finished : finished.slice(-RECENT_FINISHED);
+	const finished = jobs.filter(j => j.status !== "running")
+		.sort((a, b) => (b.endedAt ?? b.startedAt) - (a.endedAt ?? a.startedAt));
+	const done = all ? finished : finished.slice(0, RECENT_FINISHED);
 	const older = finished.length - done.length;
 	const out: string[] = [];
 	if (running.length) out.push(`Running (${running.length}):`, ...running.map(j => `  ${formatJobLine(j, now)}`));

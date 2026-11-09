@@ -147,7 +147,7 @@ test("formatNotification: compact watch match", () => {
 });
 
 test("formatJobList shows running plus last 5 finished unless all", () => {
-	const jobs = [snap({ id: "j0" }), ...Array.from({ length: 8 }, (_, i) => snap({ id: `f${i}`, status: "succeeded", exitCode: 0, endedAt: 1000 }))];
+	const jobs = [snap({ id: "j0" }), ...Array.from({ length: 8 }, (_, i) => snap({ id: `f${i}`, status: "succeeded", exitCode: 0, endedAt: 1000 + i }))];
 	const out = formatJobList(jobs, 2000);
 	assert.match(out, /Recent \(5\):/);
 	assert.doesNotMatch(out, /f0 /);
@@ -156,6 +156,16 @@ test("formatJobList shows running plus last 5 finished unless all", () => {
 	const all = formatJobList(jobs, 2000, true);
 	assert.match(all, /Recent \(8\):/);
 	assert.doesNotMatch(all, /older finished/);
+});
+
+test("formatJobList shows the newest finished jobs regardless of input order", () => {
+	const mk = (id: string, endedAt: number) => snap({ id, status: "succeeded", exitCode: 0, endedAt });
+	const jobs = [mk("n3", 7000), mk("n1", 9000), mk("o1", 1000), mk("n5", 5000), mk("o2", 2000), mk("n2", 8000), mk("n4", 6000)];
+	const out = formatJobList(jobs, 10000);
+	assert.match(out, /Recent \(5\):/);
+	assert.doesNotMatch(out, /o1 |o2 /);
+	assert.deepEqual([...out.matchAll(/\b(n\d) /g)].map(m => m[1]), ["n1", "n2", "n3", "n4", "n5"]);
+	assert.match(out, /… 2 older finished/);
 });
 
 test("formatJobList groups running and recent", () => {
