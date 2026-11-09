@@ -135,6 +135,39 @@ test("formatNotification: watch timeout without output", () => {
 	assert.match(text, /\(no last check output\)$/);
 });
 
+test("formatNotification: compact watch match", () => {
+	const job = snap({ kind: "watch", status: "matched", until: "success", checks: 3, endedAt: 30_000, label: "ready" });
+	assert.equal(formatNotification(job, { text: "built", truncated: false }), "Watch j1 matched (ready, after 30s): built");
+	assert.equal(formatNotification(job, { text: "", truncated: false }), "Watch j1 matched (ready, after 30s).");
+	const long = Array.from({ length: 30 }, (_, i) => `line ${i}`).join("\n");
+	const lines = formatNotification(job, { text: long, truncated: false }).split("\n");
+	assert.equal(lines.length, 10);
+	assert.equal(lines[9], "line 29");
+	assert.ok(Buffer.byteLength(formatNotification(job, { text: "x".repeat(5000), truncated: false })) < 1200);
+});
+
+test("formatJobList shows running plus last 5 finished unless all", () => {
+	const jobs = [snap({ id: "j0" }), ...Array.from({ length: 8 }, (_, i) => snap({ id: `f${i}`, status: "succeeded", exitCode: 0, endedAt: 1000 + i }))];
+	const out = formatJobList(jobs, 2000);
+	assert.match(out, /Recent \(5\):/);
+	assert.doesNotMatch(out, /f0 /);
+	assert.match(out, /f7 /);
+	assert.match(out, /… 3 older finished \(job_list all: true\)$/);
+	const all = formatJobList(jobs, 2000, true);
+	assert.match(all, /Recent \(8\):/);
+	assert.doesNotMatch(all, /older finished/);
+});
+
+test("formatJobList shows the newest finished jobs regardless of input order", () => {
+	const mk = (id: string, endedAt: number) => snap({ id, status: "succeeded", exitCode: 0, endedAt });
+	const jobs = [mk("n3", 7000), mk("n1", 9000), mk("o1", 1000), mk("n5", 5000), mk("o2", 2000), mk("n2", 8000), mk("n4", 6000)];
+	const out = formatJobList(jobs, 10000);
+	assert.match(out, /Recent \(5\):/);
+	assert.doesNotMatch(out, /o1 |o2 /);
+	assert.deepEqual([...out.matchAll(/\b(n\d) /g)].map(m => m[1]), ["n1", "n2", "n3", "n4", "n5"]);
+	assert.match(out, /… 2 older finished/);
+});
+
 test("formatJobList groups running and recent", () => {
 	assert.equal(formatJobList([]), "No background jobs in this session.");
 	const out = formatJobList([snap(), snap({ id: "j2", status: "succeeded", exitCode: 0, endedAt: 1000 })], 2000);
